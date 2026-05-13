@@ -1,0 +1,9 @@
+.venv/
+.env
+*.pyc
+__pycache__/
+logs/*.log
+*.csv
+.DS_Store
+trade_settings.db
+.claude/
