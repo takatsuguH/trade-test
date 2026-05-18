@@ -5,6 +5,10 @@ from pathlib import Path
 
 DB_PATH = Path("trade_settings.db")
 
+DEFAULT_GLOBAL: dict = {
+    "period": "1y",
+}
+
 DEFAULT_SETTINGS: dict = {
     # メイン4指標
     "use_ma": True,   "ma_short": 5,     "ma_long": 25,
@@ -69,6 +73,14 @@ DEFAULT_SETTINGS: dict = {
     # SQUEEZE_SCORE 閾値
     "squeeze_high": 0.50,
     "squeeze_mid": 0.35,
+    # リスク管理（銘柄別）
+    "stop_loss": 5,
+    "take_profit": 10,
+    "max_pos": 100,
+    "rebuy_dip": 0,
+    # 投資設定（銘柄別）
+    "initial_cash": 1_000_000,
+    "max_shares": 0,
 }
 
 
@@ -81,6 +93,11 @@ def _conn() -> sqlite3.Connection:
 def init_db() -> None:
     with _conn() as conn:
         conn.executescript("""
+            CREATE TABLE IF NOT EXISTS global_settings (
+                id INTEGER PRIMARY KEY DEFAULT 1,
+                settings_json TEXT NOT NULL,
+                updated_at TEXT DEFAULT (datetime('now','localtime'))
+            );
             CREATE TABLE IF NOT EXISTS stocks (
                 code TEXT PRIMARY KEY,
                 created_at TEXT DEFAULT (datetime('now','localtime'))
@@ -102,6 +119,24 @@ def init_db() -> None:
                 updated_at TEXT DEFAULT (datetime('now','localtime'))
             );
         """)
+
+
+def load_global_settings() -> dict:
+    with _conn() as conn:
+        row = conn.execute(
+            "SELECT settings_json FROM global_settings WHERE id = 1"
+        ).fetchone()
+        if row:
+            return {**DEFAULT_GLOBAL, **json.loads(row["settings_json"])}
+        return dict(DEFAULT_GLOBAL)
+
+
+def save_global_settings(settings: dict) -> None:
+    with _conn() as conn:
+        conn.execute("""
+            INSERT OR REPLACE INTO global_settings (id, settings_json, updated_at)
+            VALUES (1, ?, datetime('now','localtime'))
+        """, (json.dumps(settings, ensure_ascii=False),))
 
 
 def load_stocks() -> list[str]:

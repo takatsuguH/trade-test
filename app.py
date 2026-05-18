@@ -603,13 +603,8 @@ def _build_ext_params(s: dict) -> dict:
     }
 
 
-# ─────────────────────────────────────────────
-# サイドバー設定
-# ─────────────────────────────────────────────
-with st.sidebar:
-    st.header("銘柄設定")
-
-    # ── 動的銘柄リスト（DB連携） ──
+def _ensure_ticker_items() -> None:
+    """銘柄リストを DB から session_state に読み込む。"""
     if "ticker_items" not in st.session_state:
         codes = db.load_stocks()
         if not codes:
@@ -620,289 +615,486 @@ with st.sidebar:
             {"id": str(uuid.uuid4()), "code": _c} for _c in codes
         ]
 
-    st.caption("日本株は末尾に .T を付けてください")
-    remove_id = None
-    for item in st.session_state.ticker_items:
-        uid = item["id"]
-        col_code, col_name, col_del = st.columns([3, 5, 1])
 
-        code = col_code.text_input(
-            uid,
-            value=item["code"],
-            key=f"ti_{uid}",
-            label_visibility="collapsed",
-            placeholder="例: 7203.T",
+def _prepare_ticker_df_and_backtest(
+    ticker: str, period: str
+) -> tuple[pd.DataFrame | None, dict | None, dict]:
+    """データ取得・指標計算・バックテスト。失敗時は (None, None, {})。"""
+    _s = _get_ticker_settings(ticker)
+    ic = _build_indicator_config(_s)
+    active = _build_active_indicators(_s)
+    ext_params = _build_ext_params(_s)
+    extra_cols = _s.get("extra_checked", [])
+    extra_overlays = [
+        c for c in extra_cols if INDICATOR_META.get(c, {}).get("type") == "overlay"
+    ]
+    extra_oscillators = [
+        c for c in extra_cols if INDICATOR_META.get(c, {}).get("type") != "overlay"
+    ]
+
+    try:
+        df = get_stock_data(ticker, period=period)
+    except Exception:
+        return None, None, {}
+
+    df = calculate_all(df, ic)
+    df = calculate_short_signals(df)
+
+    df_ext = None
+    if extra_cols:
+        _ext_sig = _json.dumps(ext_params, sort_keys=True)
+        _ext_sig_key = f"df_ext_sig_{ticker}_{period}"
+        ext_df_key = f"df_ext_{ticker}_{period}"
+        if st.session_state.get(_ext_sig_key) != _ext_sig or ext_df_key not in st.session_state:
+            st.session_state[ext_df_key] = calculate_extended(df, ext_params)
+            st.session_state[_ext_sig_key] = _ext_sig
+        df_ext = st.session_state[ext_df_key]
+        for _col in df_ext.columns:
+            if _col not in df.columns:
+                df[_col] = df_ext[_col]
+        df, _ext_sig_cols = generate_ext_signals(df, extra_cols, params=_s)
+        df = merge_all_signals(df, active, _ext_sig_cols)
+    else:
+        df = generate_composite_signal(df, active)
+
+    _fund_settings = _get_fund_settings(ticker)
+    _fund_data = get_fundamental_data_cached(ticker)
+    _fund_result = calculate_fundamental_signals(_fund_data, _fund_settings)
+    _fund_score = _fund_result["score"]
+    _fund_count = _fund_result["enabled_count"]
+    _fund_integrate = st.session_state.get(f"fund_integrate_{ticker}", False)
+
+    if _fund_integrate and _fund_count > 0 and "vote_sum" in df.columns:
+        _tech_col_count = len(active) + len(extra_cols)
+        _tech_threshold = max(1, _tech_col_count / 2)
+        df["vote_sum"] = df["vote_sum"] + _fund_score
+        df["composite_signal"] = 0
+        df.loc[df["vote_sum"] >= _tech_threshold, "composite_signal"] = 1
+        df.loc[df["vote_sum"] <= -_tech_threshold, "composite_signal"] = -1
+        df["order"] = df["composite_signal"].diff()
+
+    initial_cash = int(_s.get("initial_cash", 1_000_000))
+    _max_shares = int(_s.get("max_shares", 0))
+    risk = RiskManager(
+        stop_loss_pct=_s.get("stop_loss", 5),
+        take_profit_pct=_s.get("take_profit", 10),
+        max_position_pct=_s.get("max_pos", 100),
+        rebuy_dip_pct=_s.get("rebuy_dip", 0),
+    )
+    result = run_backtest(df, initial_cash=initial_cash, risk=risk, max_shares=_max_shares)
+
+    ctx = {
+        "_s": _s,
+        "ic": ic,
+        "active": active,
+        "extra_cols": extra_cols,
+        "extra_overlays": extra_overlays,
+        "extra_oscillators": extra_oscillators,
+        "df_ext": df_ext,
+        "_fund_count": _fund_count,
+        "_fund_signals": _fund_result["signals"],
+        "_fund_integrate": _fund_integrate,
+        "initial_cash": initial_cash,
+    }
+    return df, result, ctx
+
+
+def _refresh_portfolio_summaries(tickers: list[str], period: str) -> None:
+    """登録銘柄すべてのバックテスト結果をサイドバー集計用に更新する。"""
+    for t in tickers:
+        _df, _res, _ = _prepare_ticker_df_and_backtest(t, period)
+        if _res is not None:
+            st.session_state[f"bt_summary_{t}"] = {
+                "initial_cash": _res["initial_cash"],
+                "final_value": _res["final_value"],
+            }
+
+
+_ensure_ticker_items()
+# ─────────────────────────────────────────────
+# サイドバー設定
+# ─────────────────────────────────────────────
+with st.sidebar:
+    # ── ポートフォリオサマリー ──
+    _sb_tickers = [
+        item["code"]
+        for item in st.session_state.get("ticker_items", [])
+        if item["code"]
+    ]
+    _all_initial = sum(
+        st.session_state[f"bt_summary_{t}"]["initial_cash"]
+        for t in _sb_tickers if f"bt_summary_{t}" in st.session_state
+    )
+    _all_final = sum(
+        st.session_state[f"bt_summary_{t}"]["final_value"]
+        for t in _sb_tickers if f"bt_summary_{t}" in st.session_state
+    )
+    _cached_n = sum(1 for t in _sb_tickers if f"bt_summary_{t}" in st.session_state)
+
+    if _cached_n > 0 and _all_initial > 0:
+        _total_profit = _all_final - _all_initial
+        _total_ret_pct = _total_profit / _all_initial * 100
+        _pcolor = "#00ff88" if _total_profit >= 0 else "#ff4060"
+        _sign = "+" if _total_profit >= 0 else ""
+        st.markdown(
+            f"""<div style='background:#111827;border:1px solid #1e2d40;border-radius:8px;
+                padding:10px 12px;margin-bottom:8px'>
+              <div style='font-size:0.68rem;color:#8892a4;margin-bottom:4px'>
+                ポートフォリオ合計（{_cached_n}銘柄）</div>
+              <div style='font-size:0.75rem;color:#8892a4'>
+                初期投資合計: <span style='color:#e8eaf0'>{_all_initial:,.0f}円</span></div>
+              <div style='font-size:0.75rem;color:#8892a4'>
+                損益合計: <span style='color:{_pcolor};font-weight:600'>
+                  {_sign}{_total_profit:,.0f}円</span></div>
+              <div style='font-size:0.85rem;color:{_pcolor};font-weight:700;margin-top:2px'>
+                合計リターン: {_total_ret_pct:+.2f}%</div>
+            </div>""",
+            unsafe_allow_html=True,
         )
-        new_code = code.strip()
-        if new_code != item["code"]:
-            if item["code"]:
-                db.remove_stock(item["code"])
-            if new_code:
-                db.add_stock(new_code)
-            item["code"] = new_code
+    else:
+        st.caption("銘柄を表示するとリターンが集計されます")
 
-        if item["code"]:
-            name = get_company_name(item["code"])
-            col_name.markdown(
-                f"<div style='padding-top:6px;font-size:0.78rem;color:#aaa'>{name}</div>",
-                unsafe_allow_html=True,
+    st.toggle("📊 基本情報パネル", value=True, key="_show_right_panel")
+    st.divider()
+
+    with st.expander("📈 銘柄設定"):
+        _ensure_ticker_items()
+        st.caption("日本株は末尾に .T を付けてください")
+        remove_id = None
+        for item in st.session_state.ticker_items:
+            uid = item["id"]
+            col_code, col_name, col_del = st.columns([3, 5, 1])
+
+            code = col_code.text_input(
+                uid,
+                value=item["code"],
+                key=f"ti_{uid}",
+                label_visibility="collapsed",
+                placeholder="例: 7203.T",
             )
+            new_code = code.strip()
+            if new_code != item["code"]:
+                if item["code"]:
+                    db.remove_stock(item["code"])
+                if new_code:
+                    db.add_stock(new_code)
+                item["code"] = new_code
 
-        if col_del.button("✕", key=f"td_{uid}", help="削除"):
-            remove_id = uid
+            if item["code"]:
+                name = get_company_name(item["code"])
+                col_name.markdown(
+                    f"<div style='padding-top:6px;font-size:0.78rem;color:#aaa'>{name}</div>",
+                    unsafe_allow_html=True,
+                )
 
-    if remove_id:
-        removed = next((x for x in st.session_state.ticker_items if x["id"] == remove_id), None)
-        if removed and removed["code"]:
-            db.remove_stock(removed["code"])
-        st.session_state.ticker_items = [
-            x for x in st.session_state.ticker_items if x["id"] != remove_id
-        ]
-        st.rerun()
+            if col_del.button("✕", key=f"td_{uid}", help="削除"):
+                remove_id = uid
 
-    if st.button("＋ 銘柄を追加", use_container_width=True):
-        st.session_state.ticker_items.append({"id": str(uuid.uuid4()), "code": ""})
-        st.rerun()
+        if remove_id:
+            removed = next((x for x in st.session_state.ticker_items if x["id"] == remove_id), None)
+            if removed and removed["code"]:
+                db.remove_stock(removed["code"])
+            st.session_state.ticker_items = [
+                x for x in st.session_state.ticker_items if x["id"] != remove_id
+            ]
+            st.rerun()
 
-    tickers = [item["code"] for item in st.session_state.ticker_items if item["code"]]
+        if st.button("＋ 銘柄を追加", use_container_width=True):
+            st.session_state.ticker_items.append({"id": str(uuid.uuid4()), "code": ""})
+            st.rerun()
 
-    # アクティブ銘柄の同期（サイドバー・ダッシュボード双方向）
+        _period_opts = ["1mo", "3mo", "6mo", "1y", "2y"]
+        if "_period" not in st.session_state:
+            st.session_state["_period"] = db.load_global_settings().get("period", "1y")
+        period = st.selectbox(
+            "取得期間",
+            _period_opts,
+            index=_period_opts.index(st.session_state["_period"]),
+            format_func=lambda x: {"1mo": "1ヶ月", "3mo": "3ヶ月", "6mo": "6ヶ月", "1y": "1年", "2y": "2年"}[x],
+            key="_period",
+        )
+        db.save_global_settings({"period": period})
+
+    # expander外でも tickers / active_ticker / period を常時計算
+    tickers = [item["code"] for item in st.session_state.get("ticker_items", []) if item["code"]]
     if "active_ticker" not in st.session_state or st.session_state.get("active_ticker") not in tickers:
         st.session_state.active_ticker = tickers[0] if tickers else ""
+    period = st.session_state.get("_period", "1y")
 
-    period = st.selectbox(
-        "取得期間",
-        ["1mo", "3mo", "6mo", "1y", "2y"],
-        index=3,
-        format_func=lambda x: {"1mo": "1ヶ月", "3mo": "3ヶ月", "6mo": "6ヶ月", "1y": "1年", "2y": "2年"}[x],
-    )
-
-    st.divider()
-    st.header("テクニカル指標設定")
-
-    # ── 設定を編集する銘柄を選択（ダッシュボードと双方向同期）──
-    _at = st.session_state.get("active_ticker", "")
-    _at_idx = tickers.index(_at) if _at in tickers else 0
-    settings_ticker = st.selectbox(
-        "設定を編集する銘柄",
-        options=tickers if tickers else [""],
-        index=_at_idx,
-        format_func=lambda x: (f"{x}  {get_company_name(x)}" if x else "(銘柄なし)"),
-    )
-    # サイドバー変更 → active_ticker へ反映
-    if settings_ticker and settings_ticker != st.session_state.get("active_ticker"):
-        st.session_state.active_ticker = settings_ticker
-
-    if settings_ticker:
-        pfx = f"cfg_{settings_ticker}"
-        _init_key = f"_cfg_init_{settings_ticker}"
-
-        # 初回、または銘柄切替でウィジェット session_state が消えたときに DB から再展開
-        _needs_init = (
-            not st.session_state.get(_init_key)
-            or f"{pfx}_use_ma" not in st.session_state
+    with st.expander("⚙️ テクニカル指標設定"):
+        # ── 設定を編集する銘柄を選択（ダッシュボードと双方向同期）──
+        _at = st.session_state.get("active_ticker", "")
+        _at_idx = tickers.index(_at) if _at in tickers else 0
+        settings_ticker = st.selectbox(
+            "設定を編集する銘柄",
+            options=tickers if tickers else [""],
+            index=_at_idx,
+            format_func=lambda x: (f"{x}  {get_company_name(x)}" if x else "(銘柄なし)"),
         )
-        if _needs_init:
-            _s0 = db.load_settings(settings_ticker)
-            _s0 = {**db.DEFAULT_SETTINGS, **_s0}
-            for _k, _v in db.DEFAULT_SETTINGS.items():
-                if _k != "extra_checked":
-                    _sk = f"{pfx}_{_k}"
-                    if _sk not in st.session_state:
-                        st.session_state[_sk] = _s0.get(_k, _v)
-            _ec0 = _s0.get("extra_checked", [])
-            for _, _grp in _SIDEBAR_EXTRA_GROUPS:
-                for _, _cn in _grp:
-                    _ek = f"{pfx}_ext_{_cn}"
-                    if _ek not in st.session_state:
-                        st.session_state[_ek] = _cn in _ec0
-            st.session_state[_init_key] = True
+        # サイドバー変更 → active_ticker へ反映
+        if settings_ticker and settings_ticker != st.session_state.get("active_ticker"):
+            st.session_state.active_ticker = settings_ticker
 
-        # ── メイン4指標 ──
-        _use_ma = st.checkbox("移動平均（MA）", key=f"{pfx}_use_ma")
-        if _use_ma:
-            _c1, _c2 = st.columns(2)
-            _c1.number_input("短期", min_value=2,  max_value=50,  step=1, key=f"{pfx}_ma_short")
-            _c2.number_input("長期", min_value=5,  max_value=200, step=1, key=f"{pfx}_ma_long")
+        if settings_ticker:
+            pfx = f"cfg_{settings_ticker}"
+            _init_key = f"_cfg_init_{settings_ticker}"
 
-        _use_rsi = st.checkbox("RSI", key=f"{pfx}_use_rsi")
-        if _use_rsi:
-            st.slider("RSI 期間", 5, 30, key=f"{pfx}_rsi_period")
-            _c1, _c2 = st.columns(2)
-            _c1.number_input("買われすぎ", min_value=60, max_value=90, step=1, key=f"{pfx}_rsi_ob")
-            _c2.number_input("売られすぎ", min_value=10, max_value=40, step=1, key=f"{pfx}_rsi_os")
+            # 初回、または銘柄切替でウィジェット session_state が消えたときに DB から再展開
+            _needs_init = (
+                not st.session_state.get(_init_key)
+                or f"{pfx}_use_ma" not in st.session_state
+            )
+            if _needs_init:
+                _s0 = db.load_settings(settings_ticker)
+                _s0 = {**db.DEFAULT_SETTINGS, **_s0}
+                for _k, _v in db.DEFAULT_SETTINGS.items():
+                    if _k != "extra_checked":
+                        _sk = f"{pfx}_{_k}"
+                        if _sk not in st.session_state:
+                            st.session_state[_sk] = _s0.get(_k, _v)
+                _ec0 = _s0.get("extra_checked", [])
+                for _, _grp in _SIDEBAR_EXTRA_GROUPS:
+                    for _, _cn in _grp:
+                        _ek = f"{pfx}_ext_{_cn}"
+                        if _ek not in st.session_state:
+                            st.session_state[_ek] = _cn in _ec0
+                st.session_state[_init_key] = True
 
-        _use_macd = st.checkbox("MACD", key=f"{pfx}_use_macd")
-        if _use_macd:
-            _c1, _c2, _c3 = st.columns(3)
-            _c1.number_input("Fast",   min_value=3,  max_value=50,  step=1, key=f"{pfx}_macd_fast")
-            _c2.number_input("Slow",   min_value=5,  max_value=100, step=1, key=f"{pfx}_macd_slow")
-            _c3.number_input("Signal", min_value=2,  max_value=30,  step=1, key=f"{pfx}_macd_sig")
+            # ── メイン4指標 ──
+            _use_ma = st.checkbox("移動平均（MA）", key=f"{pfx}_use_ma")
+            if _use_ma:
+                _c1, _c2 = st.columns(2)
+                _c1.number_input("短期", min_value=2,  max_value=50,  step=1, key=f"{pfx}_ma_short")
+                _c2.number_input("長期", min_value=5,  max_value=200, step=1, key=f"{pfx}_ma_long")
 
-        _use_bb = st.checkbox("ボリンジャーバンド", key=f"{pfx}_use_bb")
-        if _use_bb:
-            _c1, _c2 = st.columns(2)
-            _c1.number_input("BB期間",  min_value=5,   max_value=50,  step=1,   key=f"{pfx}_bb_period")
-            _c2.number_input("標準偏差", min_value=1.0, max_value=3.0, step=0.5,
-                             format="%.1f", key=f"{pfx}_bb_std")
+            _use_rsi = st.checkbox("RSI", key=f"{pfx}_use_rsi")
+            if _use_rsi:
+                st.slider("RSI 期間", 5, 30, key=f"{pfx}_rsi_period")
+                _c1, _c2 = st.columns(2)
+                _c1.number_input("買われすぎ", min_value=60, max_value=90, step=1, key=f"{pfx}_rsi_ob")
+                _c2.number_input("売られすぎ", min_value=10, max_value=40, step=1, key=f"{pfx}_rsi_os")
 
-        # ── 追加指標（27種）＋ パラメータ設定 ──
-        st.divider()
-        with st.expander("📊 追加テクニカル指標（27種）"):
-            st.caption("指標をチェックするとパラメータを設定できます")
-            for _grp_name, _grp_items in _SIDEBAR_EXTRA_GROUPS:
-                st.markdown(f"**{_grp_name}**")
-                for _label, _col_name in _grp_items:
-                    _meta = INDICATOR_META.get(_col_name, {})
-                    _is_checked = st.checkbox(
-                        _label,
-                        key=f"{pfx}_ext_{_col_name}",
-                        help=_meta.get("desc", ""),
+            _use_macd = st.checkbox("MACD", key=f"{pfx}_use_macd")
+            if _use_macd:
+                _c1, _c2, _c3 = st.columns(3)
+                _c1.number_input("Fast",   min_value=3,  max_value=50,  step=1, key=f"{pfx}_macd_fast")
+                _c2.number_input("Slow",   min_value=5,  max_value=100, step=1, key=f"{pfx}_macd_slow")
+                _c3.number_input("Signal", min_value=2,  max_value=30,  step=1, key=f"{pfx}_macd_sig")
+
+            _use_bb = st.checkbox("ボリンジャーバンド", key=f"{pfx}_use_bb")
+            if _use_bb:
+                _c1, _c2 = st.columns(2)
+                _c1.number_input("BB期間",  min_value=5,   max_value=50,  step=1,   key=f"{pfx}_bb_period")
+                _c2.number_input("標準偏差", min_value=1.0, max_value=3.0, step=0.5,
+                                 format="%.1f", key=f"{pfx}_bb_std")
+
+            # ── 追加指標（27種）＋ パラメータ設定 ──
+            st.divider()
+            with st.expander("📊 追加テクニカル指標（27種）"):
+                st.caption("指標をチェックするとパラメータを設定できます")
+                for _grp_name, _grp_items in _SIDEBAR_EXTRA_GROUPS:
+                    st.markdown(f"**{_grp_name}**")
+                    for _label, _col_name in _grp_items:
+                        _meta = INDICATOR_META.get(_col_name, {})
+                        _is_checked = st.checkbox(
+                            _label,
+                            key=f"{pfx}_ext_{_col_name}",
+                            help=_meta.get("desc", ""),
+                        )
+                        if _is_checked:
+                            _params_spec = _COL_PARAMS.get(_col_name, [])
+                            if _params_spec:
+                                _n = len(_params_spec)
+                                _pcols = st.columns(_n)
+                                for _pi, (_pk, _plbl, _ptyp, _pmn, _pmx, _pstep) in enumerate(_params_spec):
+                                    _wk = f"{pfx}_{_pk}"
+                                    if _ptyp == "float":
+                                        _pcols[_pi].number_input(
+                                            _plbl,
+                                            min_value=float(_pmn), max_value=float(_pmx),
+                                            step=float(_pstep), format="%.2f", key=_wk,
+                                        )
+                                    else:
+                                        _pcols[_pi].number_input(
+                                            _plbl,
+                                            min_value=int(_pmn), max_value=int(_pmx),
+                                            step=int(_pstep), key=_wk,
+                                        )
+
+            # ── 投資・リスク設定 ──
+            st.divider()
+            st.markdown("**💰 投資・リスク設定**")
+            st.number_input(
+                "初期資金（円）", min_value=100_000, step=100_000,
+                key=f"{pfx}_initial_cash",
+            )
+            st.number_input(
+                "最大株数（株）", min_value=0, step=100,
+                key=f"{pfx}_max_shares",
+                help="0=制限なし（初期資金の投資割合で自動決定）",
+            )
+            _rc1, _rc2 = st.columns(2)
+            _rc1.slider("損切りライン（%）", 1, 30, key=f"{pfx}_stop_loss")
+            _rc2.slider("利確ライン（%）",   1, 50, key=f"{pfx}_take_profit")
+            _rc1, _rc2 = st.columns(2)
+            _rc1.slider("最大投資割合（%）",   10, 100, key=f"{pfx}_max_pos")
+            _rc2.slider(
+                "買い戻し下落率（%）", 0, 20, key=f"{pfx}_rebuy_dip",
+                help="0=シグナルが出次第即時再エントリー",
+            )
+
+            # ── 保存ボタン ──
+            if st.button("💾 この銘柄の設定を保存", key=f"_save_{settings_ticker}",
+                         use_container_width=True, type="primary"):
+                _save_s = {
+                    _k: st.session_state.get(f"{pfx}_{_k}", db.DEFAULT_SETTINGS[_k])
+                    for _k in db.DEFAULT_SETTINGS if _k != "extra_checked"
+                }
+                _save_s["extra_checked"] = [
+                    _cn
+                    for _, _grp in _SIDEBAR_EXTRA_GROUPS
+                    for _, _cn in _grp
+                    if st.session_state.get(f"{pfx}_ext_{_cn}", False)
+                ]
+                db.save_settings(settings_ticker, _save_s)
+                for _ck in list(st.session_state.keys()):
+                    if (_ck.startswith(f"df_ext_{settings_ticker}_") or
+                            _ck.startswith(f"corr_cache_{settings_ticker}_") or
+                            _ck.startswith(f"opt_{settings_ticker}_")):
+                        del st.session_state[_ck]
+                st.success("設定を保存しました！")
+        else:
+            settings_ticker = tickers[0] if tickers else ""
+
+    with st.expander("📋 ファンダメンタル指標設定"):
+        _fund_ticker = st.session_state.get("active_ticker", tickers[0] if tickers else "")
+
+        if _fund_ticker:
+            _fpfx = f"fund_{_fund_ticker}"
+            _finit_key = f"_fund_init_{_fund_ticker}"
+
+            # 初回、または銘柄切替でウィジェット session_state が消えたときに DB から再展開
+            _fund_needs_init = (
+                not st.session_state.get(_finit_key)
+                or f"{_fpfx}_use_roe" not in st.session_state
+            )
+            if _fund_needs_init:
+                _fs0 = {**DEFAULT_FUND_SETTINGS, **db.load_fund_settings(_fund_ticker)}
+                for _fk, _fv in DEFAULT_FUND_SETTINGS.items():
+                    _fsk = f"{_fpfx}_{_fk}"
+                    if _fsk not in st.session_state:
+                        st.session_state[_fsk] = _fs0.get(_fk, _fv)
+                st.session_state[_finit_key] = True
+
+            with st.expander("📋 ファンダメンタル閾値設定"):
+                st.caption("各指標の買い／売りシグナル判定閾値を設定します")
+                _FUND_ROWS = [
+                    ("ROE（自己資本利益率）", "roe",        "use_roe",        "roe_buy",         "roe_sell",         "%",  0.0, 50.0, 0.5),
+                    ("ROA（総資産利益率）",    "roa",        "use_roa",        "roa_buy",         "roa_sell",         "%",  0.0, 30.0, 0.5),
+                    ("EPS成長率",             "eps_growth", "use_eps_growth", "eps_growth_buy",  "eps_growth_sell",  "%", -30.0, 100.0, 1.0),
+                    ("売上高成長率",           "rev_growth", "use_rev_growth", "rev_growth_buy",  "rev_growth_sell",  "%", -30.0, 100.0, 1.0),
+                    ("PER（株価収益率）",      "per",        "use_per",        "per_buy",         "per_sell",         "倍", 1.0, 100.0, 1.0),
+                    ("PBR（株価純資産倍率）",  "pbr",        "use_pbr",        "pbr_buy",         "pbr_sell",         "倍", 0.1, 20.0, 0.1),
+                    ("営業利益率",             "op_margin",  "use_op_margin",  "op_margin_buy",   "op_margin_sell",   "%",  0.0, 50.0, 0.5),
+                    ("負債比率（D/E×100）",    "debt_ratio", "use_debt_ratio", "debt_ratio_buy",  "debt_ratio_sell",  "",   0.0, 500.0, 5.0),
+                ]
+                for _flbl, _fkey, _fuse, _fbuy, _fsell, _funit, _fmin, _fmax, _fstep in _FUND_ROWS:
+                    _use_checked = st.checkbox(
+                        _flbl, key=f"{_fpfx}_{_fuse}",
                     )
-                    if _is_checked:
-                        _params_spec = _COL_PARAMS.get(_col_name, [])
-                        if _params_spec:
-                            _n = len(_params_spec)
-                            _pcols = st.columns(_n)
-                            for _pi, (_pk, _plbl, _ptyp, _pmn, _pmx, _pstep) in enumerate(_params_spec):
-                                _wk = f"{pfx}_{_pk}"
-                                if _ptyp == "float":
-                                    _pcols[_pi].number_input(
-                                        _plbl,
-                                        min_value=float(_pmn), max_value=float(_pmx),
-                                        step=float(_pstep), format="%.2f", key=_wk,
-                                    )
-                                else:
-                                    _pcols[_pi].number_input(
-                                        _plbl,
-                                        min_value=int(_pmn), max_value=int(_pmx),
-                                        step=int(_pstep), key=_wk,
-                                    )
+                    if _use_checked:
+                        _fc1, _fc2 = st.columns(2)
+                        if _fkey in ("per", "pbr", "debt_ratio"):
+                            _fc1.number_input(
+                                f"買い閾値（{_funit}以下）" if _funit else "買い閾値（以下）",
+                                min_value=_fmin, max_value=_fmax, step=_fstep,
+                                format="%.1f", key=f"{_fpfx}_{_fbuy}",
+                            )
+                            _fc2.number_input(
+                                f"売り閾値（{_funit}以上）" if _funit else "売り閾値（以上）",
+                                min_value=_fmin, max_value=_fmax, step=_fstep,
+                                format="%.1f", key=f"{_fpfx}_{_fsell}",
+                            )
+                        else:
+                            _fc1.number_input(
+                                f"買い閾値（{_funit}以上）" if _funit else "買い閾値（以上）",
+                                min_value=_fmin, max_value=_fmax, step=_fstep,
+                                format="%.1f", key=f"{_fpfx}_{_fbuy}",
+                            )
+                            _fc2.number_input(
+                                f"売り閾値（{_funit}以下）" if _funit else "売り閾値（以下）",
+                                min_value=_fmin, max_value=_fmax, step=_fstep,
+                                format="%.1f", key=f"{_fpfx}_{_fsell}",
+                            )
 
-        # ── 保存ボタン ──
-        if st.button("💾 この銘柄の設定を保存", key=f"_save_{settings_ticker}",
-                     use_container_width=True, type="primary"):
-            _save_s = {
-                _k: st.session_state.get(f"{pfx}_{_k}", db.DEFAULT_SETTINGS[_k])
-                for _k in db.DEFAULT_SETTINGS if _k != "extra_checked"
-            }
-            _save_s["extra_checked"] = [
-                _cn
-                for _, _grp in _SIDEBAR_EXTRA_GROUPS
-                for _, _cn in _grp
-                if st.session_state.get(f"{pfx}_ext_{_cn}", False)
-            ]
-            db.save_settings(settings_ticker, _save_s)
-            for _ck in list(st.session_state.keys()):
-                if (_ck.startswith(f"df_ext_{settings_ticker}_") or
-                        _ck.startswith(f"corr_cache_{settings_ticker}_") or
-                        _ck.startswith(f"opt_{settings_ticker}_")):
-                    del st.session_state[_ck]
-            st.success("設定を保存しました！")
+            if st.button("💾 ファンダメンタル設定を保存", key=f"_fund_save_{_fund_ticker}",
+                         use_container_width=True, type="primary"):
+                _fsave = {
+                    _fk: st.session_state.get(f"{_fpfx}_{_fk}", DEFAULT_FUND_SETTINGS[_fk])
+                    for _fk in DEFAULT_FUND_SETTINGS
+                }
+                db.save_fund_settings(_fund_ticker, _fsave)
+                st.success("ファンダメンタル設定を保存しました！")
 
-    st.divider()
-    st.header("ファンダメンタル指標設定")
-
-    _fund_ticker = settings_ticker  # テクニカル設定と同じ銘柄を使用（双方向同期）
-
-    if _fund_ticker:
-        _fpfx = f"fund_{_fund_ticker}"
-        _finit_key = f"_fund_init_{_fund_ticker}"
-
-        # 初回、または銘柄切替でウィジェット session_state が消えたときに DB から再展開
-        _fund_needs_init = (
-            not st.session_state.get(_finit_key)
-            or f"{_fpfx}_use_roe" not in st.session_state
+    with st.expander("🔄 自動更新"):
+        auto_refresh = st.toggle("リアルタイム更新", value=False)
+        refresh_sec = st.select_slider(
+            "更新間隔",
+            options=[30, 60, 120, 300],
+            value=60,
+            format_func=lambda x: f"{x}秒",
         )
-        if _fund_needs_init:
-            _fs0 = {**DEFAULT_FUND_SETTINGS, **db.load_fund_settings(_fund_ticker)}
-            for _fk, _fv in DEFAULT_FUND_SETTINGS.items():
-                _fsk = f"{_fpfx}_{_fk}"
-                if _fsk not in st.session_state:
-                    st.session_state[_fsk] = _fs0.get(_fk, _fv)
-            st.session_state[_finit_key] = True
 
-        with st.expander("📋 ファンダメンタル閾値設定"):
-            st.caption("各指標の買い／売りシグナル判定閾値を設定します")
-            _FUND_ROWS = [
-                ("ROE（自己資本利益率）", "roe",        "use_roe",        "roe_buy",         "roe_sell",         "%",  0.0, 50.0, 0.5),
-                ("ROA（総資産利益率）",    "roa",        "use_roa",        "roa_buy",         "roa_sell",         "%",  0.0, 30.0, 0.5),
-                ("EPS成長率",             "eps_growth", "use_eps_growth", "eps_growth_buy",  "eps_growth_sell",  "%", -30.0, 100.0, 1.0),
-                ("売上高成長率",           "rev_growth", "use_rev_growth", "rev_growth_buy",  "rev_growth_sell",  "%", -30.0, 100.0, 1.0),
-                ("PER（株価収益率）",      "per",        "use_per",        "per_buy",         "per_sell",         "倍", 1.0, 100.0, 1.0),
-                ("PBR（株価純資産倍率）",  "pbr",        "use_pbr",        "pbr_buy",         "pbr_sell",         "倍", 0.1, 20.0, 0.1),
-                ("営業利益率",             "op_margin",  "use_op_margin",  "op_margin_buy",   "op_margin_sell",   "%",  0.0, 50.0, 0.5),
-                ("負債比率（D/E×100）",    "debt_ratio", "use_debt_ratio", "debt_ratio_buy",  "debt_ratio_sell",  "",   0.0, 500.0, 5.0),
-            ]
-            for _flbl, _fkey, _fuse, _fbuy, _fsell, _funit, _fmin, _fmax, _fstep in _FUND_ROWS:
-                _use_checked = st.checkbox(
-                    _flbl, key=f"{_fpfx}_{_fuse}",
-                )
-                if _use_checked:
-                    _fc1, _fc2 = st.columns(2)
-                    if _fkey in ("per", "pbr", "debt_ratio"):
-                        _fc1.number_input(
-                            f"買い閾値（{_funit}以下）" if _funit else "買い閾値（以下）",
-                            min_value=_fmin, max_value=_fmax, step=_fstep,
-                            format="%.1f", key=f"{_fpfx}_{_fbuy}",
-                        )
-                        _fc2.number_input(
-                            f"売り閾値（{_funit}以上）" if _funit else "売り閾値（以上）",
-                            min_value=_fmin, max_value=_fmax, step=_fstep,
-                            format="%.1f", key=f"{_fpfx}_{_fsell}",
-                        )
-                    else:
-                        _fc1.number_input(
-                            f"買い閾値（{_funit}以上）" if _funit else "買い閾値（以上）",
-                            min_value=_fmin, max_value=_fmax, step=_fstep,
-                            format="%.1f", key=f"{_fpfx}_{_fbuy}",
-                        )
-                        _fc2.number_input(
-                            f"売り閾値（{_funit}以下）" if _funit else "売り閾値（以下）",
-                            min_value=_fmin, max_value=_fmax, step=_fstep,
-                            format="%.1f", key=f"{_fpfx}_{_fsell}",
-                        )
-
-        if st.button("💾 ファンダメンタル設定を保存", key=f"_fund_save_{_fund_ticker}",
-                     use_container_width=True, type="primary"):
-            _fsave = {
-                _fk: st.session_state.get(f"{_fpfx}_{_fk}", DEFAULT_FUND_SETTINGS[_fk])
-                for _fk in DEFAULT_FUND_SETTINGS
-            }
-            db.save_fund_settings(_fund_ticker, _fsave)
-            st.success("ファンダメンタル設定を保存しました！")
-
+    # ── ポートフォリオサマリー（全登録銘柄を合算）──
     st.divider()
-    st.header("リスク管理")
-    initial_cash = st.number_input("初期資金（円）", value=1_000_000, step=100_000, min_value=100_000)
-    stop_loss = st.slider("損切りライン（%）", 1, 30, 5)
-    take_profit = st.slider("利確ライン（%）", 1, 50, 10)
-    max_pos = st.slider("最大投資割合（%）", 10, 100, 100)
-    rebuy_dip = st.slider(
-        "買い戻し下落率（%）", 0, 20, 0,
-        help="売却後、売値よりこの%以上下がったときのみ買い戻す。0=シグナルが出次第即時再エントリー",
+    if tickers:
+        with st.spinner("ポートフォリオを集計中..."):
+            _refresh_portfolio_summaries(tickers, period)
+    _sb_tickers = list(tickers)
+    _all_initial = sum(
+        st.session_state[f"bt_summary_{t}"]["initial_cash"]
+        for t in _sb_tickers if f"bt_summary_{t}" in st.session_state
     )
+    _all_final = sum(
+        st.session_state[f"bt_summary_{t}"]["final_value"]
+        for t in _sb_tickers if f"bt_summary_{t}" in st.session_state
+    )
+    _cached_n = sum(1 for t in _sb_tickers if f"bt_summary_{t}" in st.session_state)
+    _total_n = len(_sb_tickers)
 
-    st.divider()
-    st.header("自動更新")
-    auto_refresh = st.toggle("リアルタイム更新", value=False)
-    refresh_sec = st.select_slider(
-        "更新間隔",
-        options=[30, 60, 120, 300],
-        value=60,
-        format_func=lambda x: f"{x}秒",
-    )
+    if _cached_n > 0 and _all_initial > 0:
+        _total_profit = _all_final - _all_initial
+        _total_ret_pct = _total_profit / _all_initial * 100
+        _pcolor = "#00ff88" if _total_profit >= 0 else "#ff4060"
+        _sign = "+" if _total_profit >= 0 else ""
+        _n_label = f"{_cached_n}銘柄" if _cached_n == _total_n else f"{_cached_n}/{_total_n}銘柄"
+        st.markdown(
+            f"""<motion style='background:#111827;border:1px solid #1e2d40;border-radius:8px;
+                padding:10px 12px;margin-bottom:8px'>
+              <div style='font-size:0.68rem;color:#8892a4;margin-bottom:4px'>
+                ポートフォリオ合計（{_n_label}）</motion>
+              <div style='font-size:0.75rem;color:#8892a4'>
+                初期投資合計: <span style='color:#e8eaf0'>{_all_initial:,.0f}円</span></div>
+              <div style='font-size:0.75rem;color:#8892a4'>
+                損益合計: <span style='color:{_pcolor};font-weight:600'>
+                  {_sign}{_total_profit:,.0f}円</span></motion>
+              <div style='font-size:0.85rem;color:{_pcolor};font-weight:700;margin-top:2px'>
+                合計リターン: {_total_ret_pct:+.2f}%</div>
+            </motion>""",
+            unsafe_allow_html=True,
+        )
+        if _cached_n < _total_n:
+            st.caption("一部銘柄のデータ取得に失敗したため、集計から除外されています")
+    elif _total_n > 0:
+        st.caption("銘柄データを取得できませんでした")
+    else:
+        st.caption("銘柄を登録するとリターンが集計されます")
 
 # 自動更新（ページ全体を再実行）
 if auto_refresh:
     st_autorefresh(interval=refresh_sec * 1000, key="autorefresh")
 
-risk = RiskManager(
-    stop_loss_pct=stop_loss,
-    take_profit_pct=take_profit,
-    max_position_pct=max_pos,
-    rebuy_dip_pct=rebuy_dip,
-)
+# リスク管理は銘柄別設定から取得するためここでは生成しない
 
 
 # ─────────────────────────────────────────────
@@ -1143,6 +1335,94 @@ for _ni, (_nc, _nt) in enumerate(zip(_nav_cols, tickers)):
         st.session_state.active_ticker = _nt
         st.rerun()
 
+# ── 右パネル：アクティブ銘柄のファンダメンタル情報を固定表示 ──
+if not st.session_state.get("_show_right_panel", True):
+    st.markdown(
+        "<style>.main .block-container { padding-right: 1rem !important; }</style>",
+        unsafe_allow_html=True,
+    )
+_panel_ticker = st.session_state.get("active_ticker", tickers[0] if tickers else "") if st.session_state.get("_show_right_panel", True) else None
+if _panel_ticker:
+    _pd = get_fundamental_data_cached(_panel_ticker)
+    _pfs = _get_fund_settings(_panel_ticker)
+    _pfr = calculate_fundamental_signals(_pd, _pfs)
+    _psigs = _pfr["signals"]
+    _pscore = _pfr["score"]
+    _pedinet = None
+    if _panel_ticker.upper().endswith(".T"):
+        _pcode4 = _panel_ticker.replace(".T", "").replace(".t", "")[:4]
+        _pedinet = db.load_edinet_cache(_pcode4)
+
+    def _sig_icon(k: str) -> str:
+        s = _psigs.get(k, 0)
+        return "🟢" if s > 0 else ("🔴" if s < 0 else "⚪")
+
+    def _fmt(k: str, unit: str) -> str:
+        v = _pd.get(k)
+        return f"{v:.1f}{unit}" if v is not None else "—"
+
+    _score_color = "#00ff88" if _pscore >= 2 else ("#ff4060" if _pscore <= -2 else "#8892a4")
+    _edinet_html = ""
+    if _pedinet:
+        _edinet_html = f"""
+        <div style='margin-top:10px;padding-top:8px;border-top:1px solid #1e2d40'>
+            <div style='font-size:0.7rem;color:#00d4ff;font-weight:600;margin-bottom:4px'>📄 EDINET</div>
+            <div style='font-size:0.68rem;color:#aaa;line-height:1.4'>{_pedinet.get('docDescription','—')}</div>
+            <div style='font-size:0.65rem;color:#666;margin-top:2px'>提出: {str(_pedinet.get('submitDateTime',''))[:10]}</div>
+        </div>"""
+
+    _panel_rows = [
+        ("PER", "per",        "倍"),
+        ("PBR", "pbr",        "倍"),
+        ("ROE", "roe",        "%"),
+        ("ROA", "roa",        "%"),
+        ("EPS成長", "eps_growth", "%"),
+        ("売上成長", "rev_growth", "%"),
+        ("営業利益率", "op_margin",  "%"),
+        ("負債比率",  "debt_ratio", ""),
+    ]
+    _rows_html = "".join(
+        f"<div style='display:flex;justify-content:space-between;align-items:center;"
+        f"padding:3px 0;border-bottom:1px solid #1a2236'>"
+        f"<span style='font-size:0.68rem;color:#8892a4'>{lbl}</span>"
+        f"<span style='font-size:0.72rem;color:#e8eaf0'>{_sig_icon(key)} {_fmt(key, unit)}</span>"
+        f"</div>"
+        for lbl, key, unit in _panel_rows
+    )
+    _pname = get_company_name(_panel_ticker)
+    _panel_html = f"""
+<div id="fund-right-panel" style="
+    position: fixed;
+    right: 12px;
+    top: 60px;
+    width: 190px;
+    background: #0d1321;
+    border: 1px solid #1e2d40;
+    border-radius: 10px;
+    padding: 12px;
+    z-index: 9999;
+    max-height: calc(100vh - 80px);
+    overflow-y: auto;
+    box-shadow: 0 4px 20px rgba(0,0,0,0.5);
+">
+    <div style='font-size:0.7rem;color:#00d4ff;font-weight:700;letter-spacing:0.04em;margin-bottom:6px'>📊 基本情報</div>
+    <div style='font-size:0.78rem;color:#e8eaf0;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis'>{_pname}</div>
+    <div style='font-size:0.65rem;color:#666;margin-bottom:6px'>{_panel_ticker}</div>
+    <div style='font-size:0.7rem;color:{_score_color};font-weight:600;margin-bottom:8px'>
+        総合スコア: {_pscore:+d}
+    </div>
+    {_rows_html}
+    {_edinet_html}
+</div>
+<style>
+/* 右パネル分のメインコンテンツ余白 */
+.main .block-container {{
+    padding-right: 215px !important;
+}}
+</style>
+"""
+    st.markdown(_panel_html, unsafe_allow_html=True)
+
 for ticker in tickers:
     if ticker != st.session_state.get("active_ticker"):
         continue
@@ -1207,8 +1487,21 @@ for ticker in tickers:
             df.loc[df["vote_sum"] <= -_tech_threshold, "composite_signal"] = -1
             df["order"] = df["composite_signal"].diff()
 
-        # バックテスト実行
-        result = run_backtest(df, initial_cash=initial_cash, risk=risk)
+        # バックテスト実行（銘柄別リスク・投資設定を使用）
+        initial_cash = int(_s.get("initial_cash", 1_000_000))
+        _max_shares  = int(_s.get("max_shares", 0))
+        risk = RiskManager(
+            stop_loss_pct=_s.get("stop_loss", 5),
+            take_profit_pct=_s.get("take_profit", 10),
+            max_position_pct=_s.get("max_pos", 100),
+            rebuy_dip_pct=_s.get("rebuy_dip", 0),
+        )
+        result = run_backtest(df, initial_cash=initial_cash, risk=risk, max_shares=_max_shares)
+        # サイドバーサマリー用キャッシュ
+        st.session_state[f"bt_summary_{ticker}"] = {
+            "initial_cash": result["initial_cash"],
+            "final_value":  result["final_value"],
+        }
 
         # ─── メトリクス ───
         latest = df.iloc[-1]
@@ -1236,6 +1529,34 @@ for ticker in tickers:
         col4.metric("最大DD", f"{result['max_drawdown_pct']:.2f}%")
         col5.metric("勝率", f"{result['win_rate_pct']:.1f}%")
         col6.metric("取引回数", f"{trade_count}回")
+
+        # ─── チャート ───
+        # 推奨チェックボックスのsession_state値を先読みしてチャートに反映
+        _chart_ext_overlays: list[str] = list(extra_overlays)
+        _chart_ext_oscillators: list[str] = list(extra_oscillators)
+        _cc_key = f"corr_cache_{ticker}_{period}"
+        if _cc_key in st.session_state:
+            for _r in st.session_state[_cc_key].get("corr", []):
+                _c = _r["col"]
+                if _r["type"] == "overlay" and st.session_state.get(f"ext_ov_{ticker}_{_c}") and _c not in _chart_ext_overlays:
+                    _chart_ext_overlays.append(_c)
+                    if df_ext is not None and _c in df_ext.columns and _c not in df.columns:
+                        df[_c] = df_ext[_c]
+                elif _r["type"] != "overlay" and st.session_state.get(f"ext_osc_{ticker}_{_c}") and _c not in _chart_ext_oscillators:
+                    _chart_ext_oscillators.append(_c)
+                    if df_ext is not None and _c in df_ext.columns and _c not in df.columns:
+                        df[_c] = df_ext[_c]
+        _chart_ext_overlays    = list(dict.fromkeys(_chart_ext_overlays))
+        _chart_ext_oscillators = list(dict.fromkeys(_chart_ext_oscillators))
+        fig = create_chart(df, ticker, ic,
+                           ext_overlays=_chart_ext_overlays,
+                           ext_oscillators=_chart_ext_oscillators)
+        st.plotly_chart(fig, width="stretch")
+
+        # ─── ポートフォリオ推移 ───
+        if not result["portfolio_curve"].empty:
+            fig_pf = create_portfolio_chart(result["portfolio_curve"], initial_cash)
+            st.plotly_chart(fig_pf, width="stretch")
 
         # ─── 空売り・スクイーズ分析 ───
         _sp_danger  = _s.get("sell_pressure_danger",  0.50)
@@ -1440,7 +1761,38 @@ for ticker in tickers:
                 "※ 日本株は一部データが取得できない場合があります。"
             )
 
-        # ─── 相関アラート（取引10回超 かつ リターンマイナス） ───
+        # ─── 取引履歴 ───
+        if not result["trades"].empty:
+            with st.expander(f"取引履歴 ({len(result['trades'])}件)"):
+                trades_display = result["trades"].copy()
+                trades_display["date"] = pd.to_datetime(trades_display["date"]).dt.strftime("%Y-%m-%d")
+                trades_display["price"] = trades_display["price"].map("{:,.1f}円".format)
+                trades_display["profit"] = trades_display["profit"].apply(
+                    lambda x: f"{x:+,.0f}円" if pd.notna(x) else "-"
+                )
+                trades_display.columns = ["日付", "種別", "株価", "株数", "損益"]
+                st.dataframe(trades_display, width="stretch", hide_index=True)
+
+        # ─── 指標テーブル（直近10日）───
+        with st.expander("指標データ（直近10日）"):
+            show_cols = ["Close"]
+            if _s.get("use_ma"):
+                show_cols += ["MA_short", "MA_long"]
+            if _s.get("use_rsi"):
+                show_cols += ["RSI"]
+            if _s.get("use_macd"):
+                show_cols += ["MACD", "MACD_sig"]
+            if _s.get("use_bb"):
+                show_cols += ["BB_upper", "BB_mid", "BB_lower"]
+            show_cols += ["composite_signal", "vote_sum"]
+            available = [c for c in show_cols if c in df.columns]
+            tail_df = df[available].tail(10).copy()
+            tail_df.index = tail_df.index.strftime("%Y-%m-%d")
+            st.dataframe(tail_df.round(2), width="stretch")
+
+        st.divider()
+
+        # ─── テクニカル指標おすすめ（相関アラート）───
         ext_overlays_on: list[str] = list(extra_overlays)
         ext_oscillators_on: list[str] = list(extra_oscillators)
         corr_results: list[dict] = []
@@ -1579,6 +1931,7 @@ for ticker in tickers:
                             df_bt, initial_cash, risk,
                             signal_col="ext_composite_signal",
                             order_col="ext_order",
+                            max_shares=_max_shares,
                         )
                     st.session_state[f"ext_bt_{ticker}"] = {
                         "result": ext_result,
@@ -1642,50 +1995,6 @@ for ticker in tickers:
                     td["profit"] = td["profit"].apply(lambda x: f"{x:+,.0f}円" if pd.notna(x) else "-")
                     td.columns   = ["日付", "種別", "株価", "株数", "損益"]
                     st.dataframe(td, width="stretch", hide_index=True)
-
-        st.divider()
-
-        # ─── チャート ───
-        ext_overlays_on    = list(dict.fromkeys(ext_overlays_on))
-        ext_oscillators_on = list(dict.fromkeys(ext_oscillators_on))
-        fig = create_chart(df, ticker, ic,
-                           ext_overlays=ext_overlays_on,
-                           ext_oscillators=ext_oscillators_on)
-        st.plotly_chart(fig, width="stretch")
-
-        # ─── ポートフォリオ推移 ───
-        if not result["portfolio_curve"].empty:
-            fig_pf = create_portfolio_chart(result["portfolio_curve"], initial_cash)
-            st.plotly_chart(fig_pf, width="stretch")
-
-        # ─── 取引履歴 ───
-        if not result["trades"].empty:
-            with st.expander(f"取引履歴 ({len(result['trades'])}件)"):
-                trades_display = result["trades"].copy()
-                trades_display["date"] = pd.to_datetime(trades_display["date"]).dt.strftime("%Y-%m-%d")
-                trades_display["price"] = trades_display["price"].map("{:,.1f}円".format)
-                trades_display["profit"] = trades_display["profit"].apply(
-                    lambda x: f"{x:+,.0f}円" if pd.notna(x) else "-"
-                )
-                trades_display.columns = ["日付", "種別", "株価", "株数", "損益"]
-                st.dataframe(trades_display, width="stretch", hide_index=True)
-
-        # ─── 指標テーブル（直近10日）───
-        with st.expander("指標データ（直近10日）"):
-            show_cols = ["Close"]
-            if _s.get("use_ma"):
-                show_cols += ["MA_short", "MA_long"]
-            if _s.get("use_rsi"):
-                show_cols += ["RSI"]
-            if _s.get("use_macd"):
-                show_cols += ["MACD", "MACD_sig"]
-            if _s.get("use_bb"):
-                show_cols += ["BB_upper", "BB_mid", "BB_lower"]
-            show_cols += ["composite_signal", "vote_sum"]
-            available = [c for c in show_cols if c in df.columns]
-            tail_df = df[available].tail(10).copy()
-            tail_df.index = tail_df.index.strftime("%Y-%m-%d")
-            st.dataframe(tail_df.round(2), width="stretch")
 
 # ─────────────────────────────────────────────
 # フッター

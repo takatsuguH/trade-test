@@ -9,6 +9,7 @@ def run_backtest(
     risk: RiskManager | None = None,
     signal_col: str = "composite_signal",
     order_col: str = "order",
+    max_shares: int = 0,
 ) -> dict:
     if risk is None:
         risk = RiskManager()
@@ -74,6 +75,8 @@ def run_backtest(
             if can_rebuy:
                 invest_cash = cash * risk.max_position
                 shares = int(invest_cash // price)
+                if max_shares > 0:
+                    shares = min(shares, max_shares)
                 if shares > 0:
                     position = shares
                     buy_price = price
