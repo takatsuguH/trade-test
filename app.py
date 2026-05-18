@@ -1151,6 +1151,27 @@ for tab, ticker in zip(tabs, tickers):
         else:
             df = generate_composite_signal(df, active)
 
+        # ── ファンダメンタルデータ取得（バックテスト前に実施）──
+        _is_jp_stock = ticker.upper().endswith(".T")
+        _fund_settings = _get_fund_settings(ticker)
+        _fund_data = get_fundamental_data_cached(ticker)
+        _fund_result = calculate_fundamental_signals(_fund_data, _fund_settings)
+        _fund_score = _fund_result["score"]
+        _fund_count = _fund_result["enabled_count"]
+        _fund_signals = _fund_result["signals"]
+        _fund_integrate = st.session_state.get(f"fund_integrate_{ticker}", False)
+
+        # ── ファンダメンタル統合 ──
+        # テクニカルの閾値は据え置き、fund_score を vote_sum への定数加算として扱う
+        if _fund_integrate and _fund_count > 0 and "vote_sum" in df.columns:
+            _tech_col_count = len(active) + len(extra_cols)
+            _tech_threshold = max(1, _tech_col_count / 2)
+            df["vote_sum"] = df["vote_sum"] + _fund_score
+            df["composite_signal"] = 0
+            df.loc[df["vote_sum"] >= _tech_threshold, "composite_signal"] = 1
+            df.loc[df["vote_sum"] <= -_tech_threshold, "composite_signal"] = -1
+            df["order"] = df["composite_signal"].diff()
+
         # バックテスト実行
         result = run_backtest(df, initial_cash=initial_cash, risk=risk)
 
@@ -1171,8 +1192,10 @@ for tab, ticker in zip(tabs, tickers):
 
         col1, col2, col3, col4, col5, col6 = st.columns(6)
         col1.metric("現在株価", f"{latest['Close']:,.1f}円", f"{price_change:+.2f}%")
-        total_vote_count = len(active) + len(extra_cols)
-        col2.metric("シグナル", signal_label[current_signal], f"投票: {vote:+d}/{total_vote_count}")
+        _tech_vote_count = len(active) + len(extra_cols)
+        total_vote_count = _tech_vote_count + (_fund_count if _fund_integrate else 0)
+        _vote_label = f"投票: {vote:+d}/{total_vote_count}" + (" (F統合)" if _fund_integrate and _fund_count > 0 else "")
+        col2.metric("シグナル", signal_label[current_signal], _vote_label)
         col3.metric("リターン", f"{ret_pct:.2f}%",
                     f"{result['final_value'] - result['initial_cash']:+,.0f}円")
         col4.metric("最大DD", f"{result['max_drawdown_pct']:.2f}%")
@@ -1263,14 +1286,6 @@ for tab, ticker in zip(tabs, tickers):
             )
 
         # ─── ファンダメンタル分析 ───
-        _is_jp_stock = ticker.upper().endswith(".T")
-        _fund_settings = _get_fund_settings(ticker)
-        _fund_data = get_fundamental_data_cached(ticker)
-        _fund_result = calculate_fundamental_signals(_fund_data, _fund_settings)
-        _fund_score = _fund_result["score"]
-        _fund_count = _fund_result["enabled_count"]
-        _fund_signals = _fund_result["signals"]
-
         _fund_sig_label = (
             "🟢 ファンダメンタル優良" if _fund_score >= 2 else
             "🔴 ファンダメンタル懸念" if _fund_score <= -2 else
@@ -1278,6 +1293,29 @@ for tab, ticker in zip(tabs, tickers):
         )
 
         with st.expander(f"📋 ファンダメンタル分析  {_fund_sig_label}", expanded=(_fund_score >= 3 or _fund_score <= -3)):
+
+            # ── 統合トグル ──
+            _fund_toggle_col1, _fund_toggle_col2 = st.columns([2, 3])
+            _fund_toggle_col1.toggle(
+                "テクニカルシグナルに統合する",
+                key=f"fund_integrate_{ticker}",
+                help=(
+                    "ONにすると、ファンダメンタルスコアをテクニカル投票に加算して"
+                    "複合シグナルを決定します。変更はページ再描画後に反映されます。"
+                ),
+            )
+            if _fund_integrate and _fund_count > 0:
+                _fund_toggle_col2.info(
+                    f"統合中: ファンダメンタルスコア **{_fund_score:+d}** を"
+                    f"テクニカル投票 ({_tech_vote_count}票) に加算しています。"
+                )
+            elif _fund_count > 0:
+                _fund_toggle_col2.caption(
+                    f"現在スコア: {_fund_score:+d}/{_fund_count}　"
+                    "(トグルONでバックテストに反映)"
+                )
+
+            st.divider()
 
             # EDINET接続ステータス
             if _is_jp_stock:
