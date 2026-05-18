@@ -660,6 +660,10 @@ with st.sidebar:
 
     tickers = [item["code"] for item in st.session_state.ticker_items if item["code"]]
 
+    # アクティブ銘柄の同期（サイドバー・ダッシュボード双方向）
+    if "active_ticker" not in st.session_state or st.session_state.get("active_ticker") not in tickers:
+        st.session_state.active_ticker = tickers[0] if tickers else ""
+
     period = st.selectbox(
         "取得期間",
         ["1mo", "3mo", "6mo", "1y", "2y"],
@@ -670,11 +674,11 @@ with st.sidebar:
     st.divider()
     st.header("テクニカル指標設定")
 
-    # ── 設定を編集する銘柄を選択 ──
-    _settings_opts = tickers if tickers else [""]
+    # ── 設定を編集する銘柄を選択（ダッシュボードと双方向同期）──
     settings_ticker = st.selectbox(
         "設定を編集する銘柄",
-        options=_settings_opts,
+        options=tickers if tickers else [""],
+        key="active_ticker",
         format_func=lambda x: (f"{x}  {get_company_name(x)}" if x else "(銘柄なし)"),
     )
 
@@ -784,13 +788,7 @@ with st.sidebar:
     st.divider()
     st.header("ファンダメンタル指標設定")
 
-    _fund_opts = tickers if tickers else [""]
-    _fund_ticker = st.selectbox(
-        "設定を編集する銘柄（ファンダメンタル）",
-        options=_fund_opts,
-        format_func=lambda x: (f"{x}  {get_company_name(x)}" if x else "(銘柄なし)"),
-        key="fund_settings_ticker",
-    )
+    _fund_ticker = settings_ticker  # テクニカル設定と同じ銘柄を使用（双方向同期）
 
     if _fund_ticker:
         _fpfx = f"fund_{_fund_ticker}"
@@ -1108,10 +1106,28 @@ if not tickers:
     st.warning("サイドバーで銘柄コードを入力してください。")
     st.stop()
 
-tabs = st.tabs([f"📊 {t}" for t in tickers])
+# ── 銘柄ナビゲーションボタン（企業コード＋企業名、双方向同期） ──
+if "active_ticker" not in st.session_state or st.session_state.active_ticker not in tickers:
+    st.session_state.active_ticker = tickers[0]
 
-for tab, ticker in zip(tabs, tickers):
-    with tab:
+_nav_cols = st.columns(len(tickers))
+for _ni, (_nc, _nt) in enumerate(zip(_nav_cols, tickers)):
+    _nn = get_company_name(_nt)
+    _nshort = (_nn[:8] + "…") if len(_nn) > 8 else _nn
+    _is_active = (st.session_state.active_ticker == _nt)
+    if _nc.button(
+        f"📊 {_nt}  \n{_nshort}",
+        use_container_width=True,
+        type="primary" if _is_active else "secondary",
+        key=f"_nav_{_nt}",
+    ):
+        st.session_state.active_ticker = _nt
+        st.rerun()
+
+for ticker in tickers:
+    if ticker != st.session_state.get("active_ticker"):
+        continue
+    with st.container():
         # 銘柄別設定を取得
         _s = _get_ticker_settings(ticker)
         ic = _build_indicator_config(_s)
