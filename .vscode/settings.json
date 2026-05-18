@@ -1,0 +1,8 @@
+{
+  "terminal.integrated.env.windows": {
+    "LANG": "en_US.UTF-8",
+    "PYTHONUTF8": "1",
+    "PYTHONIOENCODING": "utf-8"
+  },
+  "terminal.integrated.shellIntegration.enabled": true
+}
