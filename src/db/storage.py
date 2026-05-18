@@ -63,6 +63,12 @@ DEFAULT_SETTINGS: dict = {
     "eom_period": 14,
     # ATR
     "atr_period": 14,
+    # SELL_PRESSURE 閾値
+    "sell_pressure_danger": 0.50,
+    "sell_pressure_caution": 0.40,
+    # SQUEEZE_SCORE 閾値
+    "squeeze_high": 0.50,
+    "squeeze_mid": 0.35,
 }
 
 

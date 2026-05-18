@@ -73,7 +73,7 @@ _RULES: dict[str, callable] = {
     "ICHI_SPAN_A": lambda df: _price_vs(df, "ICHI_SPAN_A"),
     "ICHI_SPAN_B": lambda df: _price_vs(df, "ICHI_SPAN_B"),
 
-    # ── 空売り圧力・スクイーズ ──
+    # ── 空売り圧力・スクイーズ（閾値はgenerate_ext_signalsのparamsで上書き可能）──
     "SELL_PRESSURE": lambda df: df["SELL_PRESSURE"].apply(lambda x: -1 if x > 0.65 else 0),
     "SQUEEZE_SCORE": lambda df: df["SQUEEZE_SCORE"].apply(lambda x: 1 if x > 0.55 else 0),
 
@@ -95,20 +95,38 @@ _RULES: dict[str, callable] = {
 }
 
 
-def generate_ext_signals(df: pd.DataFrame, checked_cols: list[str]) -> tuple[pd.DataFrame, list[str]]:
+def generate_ext_signals(
+    df: pd.DataFrame,
+    checked_cols: list[str],
+    params: dict | None = None,
+) -> tuple[pd.DataFrame, list[str]]:
     """
     チェックされた拡張指標列ごとにシグナル列を生成する。
+    params に sell_pressure_danger / squeeze_high があればその閾値を使う。
     戻り値: (シグナル列が追加されたdf, 生成されたシグナル列名リスト)
     """
+    params = params or {}
     df = df.copy()
     signal_cols: list[str] = []
+
+    sp_danger = params.get("sell_pressure_danger", 0.50)
+    sq_high   = params.get("squeeze_high",         0.50)
+
+    dynamic_rules = {
+        **_RULES,
+        "SELL_PRESSURE": lambda df, t=sp_danger: df["SELL_PRESSURE"].apply(
+            lambda x: -1 if x > t else 0
+        ),
+        "SQUEEZE_SCORE": lambda df, t=sq_high: df["SQUEEZE_SCORE"].apply(
+            lambda x: 1 if x > t else 0
+        ),
+    }
 
     for col in checked_cols:
         if col not in df.columns:
             continue
-        rule = _RULES.get(col)
+        rule = dynamic_rules.get(col)
         if rule is None:
-            # デフォルト：ゼロクロス
             rule = lambda df, c=col: _sign(df[c])
         try:
             sig = rule(df).astype(float)

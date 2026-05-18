@@ -522,8 +522,14 @@ _COL_PARAMS: dict[str, list[tuple]] = {
     "FORCE_INDEX": [("force_period", "期間", "int", 2, 30, 1)],
     "EOM":         [("eom_period", "期間", "int", 5, 50, 1)],
     "ATR":         [("atr_period", "期間", "int", 5, 50, 1)],
-    "SELL_PRESSURE": [],
-    "SQUEEZE_SCORE": [],
+    "SELL_PRESSURE": [
+        ("sell_pressure_danger",  "危険閾値", "float", 0.1, 0.99, 0.05),
+        ("sell_pressure_caution", "警戒閾値", "float", 0.1, 0.99, 0.05),
+    ],
+    "SQUEEZE_SCORE": [
+        ("squeeze_high", "高閾値", "float", 0.1, 0.99, 0.05),
+        ("squeeze_mid",  "中閾値", "float", 0.1, 0.99, 0.05),
+    ],
 }
 
 
@@ -691,8 +697,12 @@ with st.sidebar:
         pfx = f"cfg_{settings_ticker}"
         _init_key = f"_cfg_init_{settings_ticker}"
 
-        # 初回のみ DB から session_state へ展開
-        if not st.session_state.get(_init_key):
+        # 初回、または銘柄切替でウィジェット session_state が消えたときに DB から再展開
+        _needs_init = (
+            not st.session_state.get(_init_key)
+            or f"{pfx}_use_ma" not in st.session_state
+        )
+        if _needs_init:
             _s0 = db.load_settings(settings_ticker)
             _s0 = {**db.DEFAULT_SETTINGS, **_s0}
             for _k, _v in db.DEFAULT_SETTINGS.items():
@@ -799,8 +809,12 @@ with st.sidebar:
         _fpfx = f"fund_{_fund_ticker}"
         _finit_key = f"_fund_init_{_fund_ticker}"
 
-        # 初回のみDBから展開
-        if not st.session_state.get(_finit_key):
+        # 初回、または銘柄切替でウィジェット session_state が消えたときに DB から再展開
+        _fund_needs_init = (
+            not st.session_state.get(_finit_key)
+            or f"{_fpfx}_use_roe" not in st.session_state
+        )
+        if _fund_needs_init:
             _fs0 = {**DEFAULT_FUND_SETTINGS, **db.load_fund_settings(_fund_ticker)}
             for _fk, _fv in DEFAULT_FUND_SETTINGS.items():
                 _fsk = f"{_fpfx}_{_fk}"
@@ -1055,8 +1069,8 @@ def create_chart(
         height=max(500, 420 + subplot_rows * 130),
         template="plotly_dark",
         xaxis_rangeslider_visible=False,
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-        margin=dict(l=0, r=0, t=40, b=0),
+        legend=dict(orientation="h", yanchor="top", y=-0.08, xanchor="center", x=0.5),
+        margin=dict(l=0, r=0, t=40, b=80),
     )
     return fig
 
@@ -1078,10 +1092,10 @@ def create_comparison_chart(curve1: pd.DataFrame, curve2: pd.DataFrame,
     fig.add_hline(y=initial_cash, line=dict(color="gray", dash="dash"), annotation_text="初期資金")
     fig.update_layout(
         height=280, template="plotly_dark",
-        margin=dict(l=0, r=0, t=40, b=0),
+        margin=dict(l=0, r=0, t=40, b=60),
         title="ポートフォリオ推移 比較",
         yaxis_tickformat=",",
-        legend=dict(orientation="h", y=1.1),
+        legend=dict(orientation="h", yanchor="top", y=-0.15, xanchor="center", x=0.5),
     )
     return fig
 
@@ -1167,7 +1181,7 @@ for ticker in tickers:
             for _col in df_ext.columns:
                 if _col not in df.columns:
                     df[_col] = df_ext[_col]
-            df, _ext_sig_cols = generate_ext_signals(df, extra_cols)
+            df, _ext_sig_cols = generate_ext_signals(df, extra_cols, params=_s)
             df = merge_all_signals(df, active, _ext_sig_cols)
         else:
             df = generate_composite_signal(df, active)
@@ -1224,9 +1238,14 @@ for ticker in tickers:
         col6.metric("取引回数", f"{trade_count}回")
 
         # ─── 空売り・スクイーズ分析 ───
+        _sp_danger  = _s.get("sell_pressure_danger",  0.50)
+        _sp_caution = _s.get("sell_pressure_caution", 0.40)
+        _sq_high    = _s.get("squeeze_high", 0.50)
+        _sq_mid     = _s.get("squeeze_mid",  0.35)
+
         sell_pressure_now = float(df["SELL_PRESSURE"].iloc[-1]) if "SELL_PRESSURE" in df.columns else 0.0
         squeeze_now       = float(df["SQUEEZE_SCORE"].iloc[-1])  if "SQUEEZE_SCORE" in df.columns else 0.0
-        has_short_alert   = sell_pressure_now > 0.65 or squeeze_now > 0.55
+        has_short_alert   = sell_pressure_now > _sp_danger or squeeze_now > _sq_high
 
         with st.expander("📉 空売り・スクイーズ分析", expanded=has_short_alert):
             sd = get_short_data(ticker)
@@ -1252,19 +1271,19 @@ for ticker in tickers:
                 sc2.metric("空売り比率", "データなし")
 
             # 技術的シグナル
-            pressure_label = "危険" if sell_pressure_now > 0.65 else ("警戒" if sell_pressure_now > 0.4 else "正常")
-            squeeze_label  = "高" if squeeze_now > 0.55 else ("中" if squeeze_now > 0.35 else "低")
+            pressure_label = "危険" if sell_pressure_now > _sp_danger else ("警戒" if sell_pressure_now > _sp_caution else "正常")
+            squeeze_label  = "高" if squeeze_now > _sq_high else ("中" if squeeze_now > _sq_mid else "低")
             sc3.metric("空売り圧力", f"{sell_pressure_now:.2f}", pressure_label)
             sc4.metric("スクイーズスコア", f"{squeeze_now:.2f}", f"発生確率: {squeeze_label}")
 
             # アラートメッセージ
-            if sell_pressure_now > 0.65:
+            if sell_pressure_now > _sp_danger:
                 st.warning(
                     "⚠️ **空売り圧力が高い状態です。** "
                     "大量売りを伴う下落が続いており、機関投資家による空売り積み増しの可能性があります。"
                     " 新規買いは慎重に。既存保有株の損切りラインを確認してください。"
                 )
-            if squeeze_now > 0.55:
+            if squeeze_now > _sq_high:
                 st.success(
                     "🚀 **ショートスクイーズの兆候を検知しました。** "
                     "下落トレンド後の大量買いが急増しています。"
@@ -1287,16 +1306,20 @@ for ticker in tickers:
                     x=df.index, y=df["SQUEEZE_SCORE"],
                     name="スクイーズスコア", line=dict(color="#4caf50", width=1.5),
                 ))
-                fig_ss.add_hline(y=0.65, line=dict(color="#f44336", dash="dash", width=1),
-                                 annotation_text="売り圧閾値")
-                fig_ss.add_hline(y=0.55, line=dict(color="#4caf50", dash="dash", width=1),
-                                 annotation_text="スクイーズ閾値")
+                fig_ss.add_hline(y=_sp_danger, line=dict(color="#f44336", dash="dash", width=1),
+                                 annotation_text=f"売り圧危険({_sp_danger:.2f})")
+                fig_ss.add_hline(y=_sp_caution, line=dict(color="#ff9800", dash="dash", width=1),
+                                 annotation_text=f"売り圧警戒({_sp_caution:.2f})")
+                fig_ss.add_hline(y=_sq_high, line=dict(color="#4caf50", dash="dash", width=1),
+                                 annotation_text=f"スクイーズ高({_sq_high:.2f})")
+                fig_ss.add_hline(y=_sq_mid, line=dict(color="#8bc34a", dash="dot", width=1),
+                                 annotation_text=f"スクイーズ中({_sq_mid:.2f})")
                 fig_ss.update_layout(
-                    height=200, template="plotly_dark",
-                    margin=dict(l=0, r=0, t=30, b=0),
+                    height=220, template="plotly_dark",
+                    margin=dict(l=0, r=0, t=30, b=60),
                     title="空売り圧力 / スクイーズスコア（0〜1）",
                     yaxis=dict(range=[0, 1]),
-                    legend=dict(orientation="h", y=1.1),
+                    legend=dict(orientation="h", yanchor="top", y=-0.2, xanchor="center", x=0.5),
                 )
                 st.plotly_chart(fig_ss, width="stretch")
 
@@ -1550,7 +1573,7 @@ for ticker in tickers:
                     type="primary",
                 ):
                     with st.spinner("バックテスト実行中..."):
-                        df_bt, sig_cols = generate_ext_signals(df_ext, all_checked)
+                        df_bt, sig_cols = generate_ext_signals(df_ext, all_checked, params=_s)
                         df_bt = build_ext_composite(df_bt, sig_cols)
                         ext_result = run_backtest(
                             df_bt, initial_cash, risk,
