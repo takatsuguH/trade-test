@@ -675,12 +675,17 @@ with st.sidebar:
     st.header("テクニカル指標設定")
 
     # ── 設定を編集する銘柄を選択（ダッシュボードと双方向同期）──
+    _at = st.session_state.get("active_ticker", "")
+    _at_idx = tickers.index(_at) if _at in tickers else 0
     settings_ticker = st.selectbox(
         "設定を編集する銘柄",
         options=tickers if tickers else [""],
-        key="active_ticker",
+        index=_at_idx,
         format_func=lambda x: (f"{x}  {get_company_name(x)}" if x else "(銘柄なし)"),
     )
+    # サイドバー変更 → active_ticker へ反映
+    if settings_ticker and settings_ticker != st.session_state.get("active_ticker"):
+        st.session_state.active_ticker = settings_ticker
 
     if settings_ticker:
         pfx = f"cfg_{settings_ticker}"
