@@ -6,4 +6,4 @@ logs/*.log
 *.csv
 .DS_Store
 trade_settings.db
-.claude/
+.claude/settings.local.json

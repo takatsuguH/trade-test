@@ -1,0 +1,35 @@
+{
+  "permissions": {
+    "defaultMode": "acceptEdits",
+    "allow": [
+      "Bash(npm --prefix * test)",
+      "Bash(npm --prefix * run *)",
+      "Bash(git -C * status)",
+      "Bash(git -C * diff)",
+      "Bash(git -C * log *)",
+      "Bash(make -C * test)",
+      "Bash(pnpm --dir * *)",
+      "Bash(ls *)",
+      "Bash(cat *)",
+      "Bash(pwd)",
+      "Read",
+      "Edit(src/**)",
+      "Write(src/**)",
+      "Edit(packages/**)",
+      "Write(packages/**)"
+    ],
+    "ask": [
+      "Bash(git push *)",
+      "Bash(npm install *)",
+      "Bash(rm *)"
+    ],
+    "deny": [
+      "Read(.env)",
+      "Read(**/.env)",
+      "Read(**/.env.*)",
+      "Bash(git push --force *)",
+      "Bash(rm -rf /)",
+      "Bash(rm -rf ~*)"
+    ]
+  }
+}
