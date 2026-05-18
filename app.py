@@ -20,6 +20,14 @@ from src.analysis.correlation import analyze_correlations, INDICATOR_META
 from src.indicators.signal_generator import generate_ext_signals, build_ext_composite
 from src.optimization.searcher import find_best_combination
 from src.db import storage as db
+from src.data.edinet import check_api_connection, find_latest_filing, DOC_TYPE_LABELS
+from src.indicators.fundamental import (
+    get_fundamental_data,
+    calculate_fundamental_signals,
+    DEFAULT_FUND_SETTINGS,
+    FUND_LABELS,
+    FUND_UNITS,
+)
 import json as _json
 
 # ─────────────────────────────────────────────
@@ -374,6 +382,30 @@ def get_short_data(ticker: str) -> dict:
         }
     except Exception:
         return {"short_ratio": None, "short_pct_float": None, "available": False}
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def get_fundamental_data_cached(ticker: str) -> dict:
+    """ファンダメンタルデータをキャッシュ付きで取得（24時間キャッシュ）。"""
+    return get_fundamental_data(ticker)
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def check_edinet_connection() -> bool:
+    """EDINET API接続確認（1時間キャッシュ）。"""
+    return check_api_connection()
+
+
+def _get_fund_settings(ticker: str) -> dict:
+    """セッション状態またはDBからファンダメンタル設定を取得する。"""
+    pfx = f"fund_{ticker}"
+    if st.session_state.get(f"_fund_init_{ticker}"):
+        return {
+            _k: st.session_state.get(f"{pfx}_{_k}", _v)
+            for _k, _v in DEFAULT_FUND_SETTINGS.items()
+        }
+    loaded = db.load_fund_settings(ticker)
+    return {**DEFAULT_FUND_SETTINGS, **loaded}
 
 
 # ─────────────────────────────────────────────
@@ -748,6 +780,80 @@ with st.sidebar:
                         _ck.startswith(f"opt_{settings_ticker}_")):
                     del st.session_state[_ck]
             st.success("設定を保存しました！")
+
+    st.divider()
+    st.header("ファンダメンタル指標設定")
+
+    _fund_opts = tickers if tickers else [""]
+    _fund_ticker = st.selectbox(
+        "設定を編集する銘柄（ファンダメンタル）",
+        options=_fund_opts,
+        format_func=lambda x: (f"{x}  {get_company_name(x)}" if x else "(銘柄なし)"),
+        key="fund_settings_ticker",
+    )
+
+    if _fund_ticker:
+        _fpfx = f"fund_{_fund_ticker}"
+        _finit_key = f"_fund_init_{_fund_ticker}"
+
+        # 初回のみDBから展開
+        if not st.session_state.get(_finit_key):
+            _fs0 = {**DEFAULT_FUND_SETTINGS, **db.load_fund_settings(_fund_ticker)}
+            for _fk, _fv in DEFAULT_FUND_SETTINGS.items():
+                _fsk = f"{_fpfx}_{_fk}"
+                if _fsk not in st.session_state:
+                    st.session_state[_fsk] = _fs0.get(_fk, _fv)
+            st.session_state[_finit_key] = True
+
+        with st.expander("📋 ファンダメンタル閾値設定"):
+            st.caption("各指標の買い／売りシグナル判定閾値を設定します")
+            _FUND_ROWS = [
+                ("ROE（自己資本利益率）", "roe",        "use_roe",        "roe_buy",         "roe_sell",         "%",  0.0, 50.0, 0.5),
+                ("ROA（総資産利益率）",    "roa",        "use_roa",        "roa_buy",         "roa_sell",         "%",  0.0, 30.0, 0.5),
+                ("EPS成長率",             "eps_growth", "use_eps_growth", "eps_growth_buy",  "eps_growth_sell",  "%", -30.0, 100.0, 1.0),
+                ("売上高成長率",           "rev_growth", "use_rev_growth", "rev_growth_buy",  "rev_growth_sell",  "%", -30.0, 100.0, 1.0),
+                ("PER（株価収益率）",      "per",        "use_per",        "per_buy",         "per_sell",         "倍", 1.0, 100.0, 1.0),
+                ("PBR（株価純資産倍率）",  "pbr",        "use_pbr",        "pbr_buy",         "pbr_sell",         "倍", 0.1, 20.0, 0.1),
+                ("営業利益率",             "op_margin",  "use_op_margin",  "op_margin_buy",   "op_margin_sell",   "%",  0.0, 50.0, 0.5),
+                ("負債比率（D/E×100）",    "debt_ratio", "use_debt_ratio", "debt_ratio_buy",  "debt_ratio_sell",  "",   0.0, 500.0, 5.0),
+            ]
+            for _flbl, _fkey, _fuse, _fbuy, _fsell, _funit, _fmin, _fmax, _fstep in _FUND_ROWS:
+                _use_checked = st.checkbox(
+                    _flbl, key=f"{_fpfx}_{_fuse}",
+                )
+                if _use_checked:
+                    _fc1, _fc2 = st.columns(2)
+                    if _fkey in ("per", "pbr", "debt_ratio"):
+                        _fc1.number_input(
+                            f"買い閾値（{_funit}以下）" if _funit else "買い閾値（以下）",
+                            min_value=_fmin, max_value=_fmax, step=_fstep,
+                            format="%.1f", key=f"{_fpfx}_{_fbuy}",
+                        )
+                        _fc2.number_input(
+                            f"売り閾値（{_funit}以上）" if _funit else "売り閾値（以上）",
+                            min_value=_fmin, max_value=_fmax, step=_fstep,
+                            format="%.1f", key=f"{_fpfx}_{_fsell}",
+                        )
+                    else:
+                        _fc1.number_input(
+                            f"買い閾値（{_funit}以上）" if _funit else "買い閾値（以上）",
+                            min_value=_fmin, max_value=_fmax, step=_fstep,
+                            format="%.1f", key=f"{_fpfx}_{_fbuy}",
+                        )
+                        _fc2.number_input(
+                            f"売り閾値（{_funit}以下）" if _funit else "売り閾値（以下）",
+                            min_value=_fmin, max_value=_fmax, step=_fstep,
+                            format="%.1f", key=f"{_fpfx}_{_fsell}",
+                        )
+
+        if st.button("💾 ファンダメンタル設定を保存", key=f"_fund_save_{_fund_ticker}",
+                     use_container_width=True, type="primary"):
+            _fsave = {
+                _fk: st.session_state.get(f"{_fpfx}_{_fk}", DEFAULT_FUND_SETTINGS[_fk])
+                for _fk in DEFAULT_FUND_SETTINGS
+            }
+            db.save_fund_settings(_fund_ticker, _fsave)
+            st.success("ファンダメンタル設定を保存しました！")
 
     st.divider()
     st.header("リスク管理")
@@ -1154,6 +1260,102 @@ for tab, ticker in zip(tabs, tickers):
                 "空売り圧力：大出来高を伴う下落の累積強度（0〜1）。"
                 "　スクイーズスコア：下落後の急騰＋大出来高の強度（0〜1）。"
                 "　空売りカバー日数・空売り比率はyfinanceから取得（主に米国株対応）。"
+            )
+
+        # ─── ファンダメンタル分析 ───
+        _is_jp_stock = ticker.upper().endswith(".T")
+        _fund_settings = _get_fund_settings(ticker)
+        _fund_data = get_fundamental_data_cached(ticker)
+        _fund_result = calculate_fundamental_signals(_fund_data, _fund_settings)
+        _fund_score = _fund_result["score"]
+        _fund_count = _fund_result["enabled_count"]
+        _fund_signals = _fund_result["signals"]
+
+        _fund_sig_label = (
+            "🟢 ファンダメンタル優良" if _fund_score >= 2 else
+            "🔴 ファンダメンタル懸念" if _fund_score <= -2 else
+            "⚪ ニュートラル"
+        )
+
+        with st.expander(f"📋 ファンダメンタル分析  {_fund_sig_label}", expanded=(_fund_score >= 3 or _fund_score <= -3)):
+
+            # EDINET接続ステータス
+            if _is_jp_stock:
+                _edinet_ok = check_edinet_connection()
+                _edinet_col1, _edinet_col2 = st.columns([1, 3])
+                if _edinet_ok:
+                    _edinet_col1.success("✅ EDINET接続済")
+                else:
+                    _edinet_col1.error("❌ EDINET接続失敗")
+
+                # EDINET最新報告書の検索ボタン
+                _code4 = ticker.replace(".T", "").replace(".t", "")[:4]
+                _edinet_cache = db.load_edinet_cache(_code4)
+                if _edinet_cache:
+                    _edinet_col2.caption(
+                        f"最新報告書: {_edinet_cache.get('docDescription', '—')}  "
+                        f"（提出日: {_edinet_cache.get('submitDateTime', '—')[:10]}）"
+                    )
+                else:
+                    _edinet_col2.caption("EDINET報告書未検索")
+
+                if st.button("🔍 EDINET最新報告書を検索", key=f"edinet_search_{ticker}"):
+                    _pb = st.progress(0.0, text="EDINET検索中...")
+                    def _edinet_cb(v: float, msg: str):
+                        _pb.progress(min(v, 0.99), text=f"EDINET {msg}")
+                    _doc = find_latest_filing(_code4, progress_cb=_edinet_cb)
+                    _pb.empty()
+                    if _doc:
+                        db.save_edinet_cache(_code4, _doc)
+                        st.success(
+                            f"📄 {_doc.get('docDescription', '—')}  "
+                            f"提出日: {_doc.get('submitDateTime', '—')[:10]}"
+                        )
+                        st.rerun()
+                    else:
+                        st.warning("EDINET報告書が見つかりませんでした。")
+
+                st.divider()
+
+            # ファンダメンタルスコアサマリー
+            _fs_col1, _fs_col2, _fs_col3 = st.columns(3)
+            _fs_col1.metric(
+                "ファンダメンタルスコア",
+                f"{_fund_score:+d} / {_fund_count}",
+                _fund_sig_label.split(" ", 1)[-1] if _fund_count > 0 else "—",
+            )
+            _fs_col2.metric("PER", f"{_fund_data.get('per', '—')}倍" if _fund_data.get('per') else "—")
+            _fs_col3.metric("PBR", f"{_fund_data.get('pbr', '—')}倍" if _fund_data.get('pbr') else "—")
+
+            # 各指標の詳細
+            st.markdown("**指標詳細**")
+            _FUND_DISPLAY = [
+                ("roe",        "ROE",      "%",  "高いほど良い"),
+                ("roa",        "ROA",      "%",  "高いほど良い"),
+                ("eps_growth", "EPS成長率", "%",  "プラス成長が良い"),
+                ("rev_growth", "売上成長率", "%", "プラス成長が良い"),
+                ("per",        "PER",      "倍", "低いほど割安"),
+                ("pbr",        "PBR",      "倍", "低いほど割安"),
+                ("op_margin",  "営業利益率", "%", "高いほど良い"),
+                ("debt_ratio", "負債比率",  "",  "低いほど健全"),
+            ]
+            _detail_cols = st.columns(4)
+            for _di, (_dkey, _dlbl, _dunit, _dhint) in enumerate(_FUND_DISPLAY):
+                _dval = _fund_data.get(_dkey)
+                _dsig = _fund_signals.get(_dkey, 0)
+                _sig_icon = "🟢" if _dsig > 0 else ("🔴" if _dsig < 0 else "⚪")
+                _val_str = (
+                    f"{_dval:.1f}{_dunit}" if _dval is not None else "データなし"
+                )
+                _detail_cols[_di % 4].metric(
+                    f"{_sig_icon} {_dlbl}",
+                    _val_str,
+                    help=_dhint,
+                )
+
+            st.caption(
+                "データソース: yfinance（Yahoo Finance）　更新: 24時間ごと　"
+                "※ 日本株は一部データが取得できない場合があります。"
             )
 
         # ─── 相関アラート（取引10回超 かつ リターンマイナス） ───

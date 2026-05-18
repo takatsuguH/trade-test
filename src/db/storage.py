@@ -85,6 +85,16 @@ def init_db() -> None:
                 updated_at TEXT DEFAULT (datetime('now','localtime')),
                 FOREIGN KEY (stock_code) REFERENCES stocks(code) ON DELETE CASCADE
             );
+            CREATE TABLE IF NOT EXISTS fundamental_settings (
+                stock_code TEXT PRIMARY KEY,
+                settings_json TEXT NOT NULL,
+                updated_at TEXT DEFAULT (datetime('now','localtime'))
+            );
+            CREATE TABLE IF NOT EXISTS edinet_cache (
+                sec_code TEXT PRIMARY KEY,
+                doc_json TEXT NOT NULL,
+                updated_at TEXT DEFAULT (datetime('now','localtime'))
+            );
         """)
 
 
@@ -121,3 +131,45 @@ def save_settings(stock_code: str, settings: dict) -> None:
             INSERT OR REPLACE INTO indicator_settings (stock_code, settings_json, updated_at)
             VALUES (?, ?, datetime('now','localtime'))
         """, (stock_code, json.dumps(settings, ensure_ascii=False)))
+
+
+# ── ファンダメンタル設定 ──────────────────────────────────────────────────────
+
+def load_fund_settings(stock_code: str) -> dict:
+    with _conn() as conn:
+        row = conn.execute(
+            "SELECT settings_json FROM fundamental_settings WHERE stock_code = ?",
+            (stock_code,)
+        ).fetchone()
+        if row:
+            return json.loads(row["settings_json"])
+        return {}
+
+
+def save_fund_settings(stock_code: str, settings: dict) -> None:
+    with _conn() as conn:
+        conn.execute("""
+            INSERT OR REPLACE INTO fundamental_settings (stock_code, settings_json, updated_at)
+            VALUES (?, ?, datetime('now','localtime'))
+        """, (stock_code, json.dumps(settings, ensure_ascii=False)))
+
+
+# ── EDINET検索キャッシュ ──────────────────────────────────────────────────────
+
+def load_edinet_cache(sec_code: str) -> dict | None:
+    with _conn() as conn:
+        row = conn.execute(
+            "SELECT doc_json FROM edinet_cache WHERE sec_code = ?",
+            (sec_code,)
+        ).fetchone()
+        if row:
+            return json.loads(row["doc_json"])
+        return None
+
+
+def save_edinet_cache(sec_code: str, doc: dict) -> None:
+    with _conn() as conn:
+        conn.execute("""
+            INSERT OR REPLACE INTO edinet_cache (sec_code, doc_json, updated_at)
+            VALUES (?, ?, datetime('now','localtime'))
+        """, (sec_code, json.dumps(doc, ensure_ascii=False)))
