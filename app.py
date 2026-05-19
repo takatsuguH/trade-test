@@ -409,7 +409,8 @@ def check_edinet_connection() -> bool:
 def _get_fund_settings(ticker: str) -> dict:
     """セッション状態またはDBからファンダメンタル設定を取得する。"""
     pfx = f"fund_{ticker}"
-    if st.session_state.get(f"_fund_init_{ticker}"):
+    # ウィジェットキーが実際に存在する場合のみセッション状態を使用
+    if st.session_state.get(f"_fund_init_{ticker}") and f"{pfx}_use_roe" in st.session_state:
         return {
             _k: st.session_state.get(f"{pfx}_{_k}", _v)
             for _k, _v in DEFAULT_FUND_SETTINGS.items()
@@ -576,6 +577,18 @@ def _save_all_settings(ticker: str) -> None:
         if st.session_state.get(f"{pfx}_ext_{_cn}", False)
     ]
     db.save_settings(ticker, _s)
+
+
+def _save_all_fund_settings(ticker: str) -> None:
+    """ファンダメンタル設定を即時DBへ保存するコールバック。"""
+    pfx = f"fund_{ticker}"
+    if f"{pfx}_use_roe" not in st.session_state:
+        return
+    _fs = {
+        _k: st.session_state.get(f"{pfx}_{_k}", _v)
+        for _k, _v in DEFAULT_FUND_SETTINGS.items()
+    }
+    db.save_fund_settings(ticker, _fs)
 
 
 def _auto_save_setting(ticker: str, setting_key: str) -> None:
@@ -833,6 +846,7 @@ def _invalidate_stale_summaries(period: str) -> None:
             f"/{_s.get('max_pos', 100)}/{_s.get('rebuy_dip', 0)}"
             f"|cash={_s.get('initial_cash', 1_000_000)}"
             f"|ext={_json.dumps(_ext_p, sort_keys=True)}"
+            f"|checked={','.join(sorted(_s.get('extra_checked', [])))}"
         )
         _hash_key = f"_sig_hash_{t}"
         if st.session_state.get(_hash_key) != _hash:
@@ -1221,6 +1235,7 @@ with st.sidebar:
                 for _flbl, _fkey, _fuse, _fbuy, _fsell, _funit, _fmin, _fmax, _fstep in _FUND_ROWS:
                     _use_checked = st.checkbox(
                         _flbl, key=f"{_fpfx}_{_fuse}",
+                        on_change=_save_all_fund_settings, args=(_fund_ticker,),
                     )
                     if _use_checked:
                         _fc1, _fc2 = st.columns(2)
@@ -1229,22 +1244,26 @@ with st.sidebar:
                                 f"買い閾値（{_funit}以下）" if _funit else "買い閾値（以下）",
                                 min_value=_fmin, max_value=_fmax, step=_fstep,
                                 format="%.1f", key=f"{_fpfx}_{_fbuy}",
+                                on_change=_save_all_fund_settings, args=(_fund_ticker,),
                             )
                             _fc2.number_input(
                                 f"売り閾値（{_funit}以上）" if _funit else "売り閾値（以上）",
                                 min_value=_fmin, max_value=_fmax, step=_fstep,
                                 format="%.1f", key=f"{_fpfx}_{_fsell}",
+                                on_change=_save_all_fund_settings, args=(_fund_ticker,),
                             )
                         else:
                             _fc1.number_input(
                                 f"買い閾値（{_funit}以上）" if _funit else "買い閾値（以上）",
                                 min_value=_fmin, max_value=_fmax, step=_fstep,
                                 format="%.1f", key=f"{_fpfx}_{_fbuy}",
+                                on_change=_save_all_fund_settings, args=(_fund_ticker,),
                             )
                             _fc2.number_input(
                                 f"売り閾値（{_funit}以下）" if _funit else "売り閾値（以下）",
                                 min_value=_fmin, max_value=_fmax, step=_fstep,
                                 format="%.1f", key=f"{_fpfx}_{_fsell}",
+                                on_change=_save_all_fund_settings, args=(_fund_ticker,),
                             )
 
             if st.button("💾 ファンダメンタル設定を保存", key=f"_fund_save_{_fund_ticker}",
