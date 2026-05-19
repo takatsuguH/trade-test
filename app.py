@@ -921,6 +921,13 @@ with st.sidebar:
                 _c1, _c2 = st.columns(2)
                 _c1.number_input("短期", min_value=2,  max_value=50,  step=1, key=f"{pfx}_ma_short")
                 _c2.number_input("長期", min_value=5,  max_value=200, step=1, key=f"{pfx}_ma_long")
+            st.toggle(
+                "🕐 時間軸適合診断を表示",
+                key=f"{pfx}_show_timeframe_diagnosis",
+                on_change=_auto_save_setting,
+                args=(settings_ticker, "show_timeframe_diagnosis"),
+                help="ONにすると現在の銘柄の時間軸適合診断（MA設定最適化）をダッシュボードに表示します。設定は自動保存されます。",
+            )
 
             _use_rsi = st.checkbox("RSI", key=f"{pfx}_use_rsi")
             if _use_rsi:
@@ -2051,153 +2058,132 @@ for ticker in tickers:
                     td.columns   = ["日付", "種別", "株価", "株数", "損益"]
                     st.dataframe(td, width="stretch", hide_index=True)
 
-# ─────────────────────────────────────────────
-# 時間軸適合診断
-# ─────────────────────────────────────────────
-st.divider()
-for ticker in tickers:
-    _tf_key = f"tf_result_{ticker}_{period}"
-    _tf_cname = _get_company_name(ticker)
-    _tf_title = f"🕐 時間軸適合診断: {ticker}" + (f"  {_tf_cname}" if _tf_cname != ticker else "")
-    # show_timeframe_diagnosis がセッション未初期化の場合はDBから取得
-    _tf_show_ss_key = f"cfg_{ticker}_show_timeframe_diagnosis"
-    if _tf_show_ss_key not in st.session_state:
-        st.session_state[_tf_show_ss_key] = _get_ticker_settings(ticker).get("show_timeframe_diagnosis", False)
-    with st.expander(_tf_title, expanded=st.session_state[_tf_show_ss_key]):
-        _tf_col1, _tf_col2 = st.columns([3, 2])
-        _tf_col1.toggle(
-            "この銘柄の診断を有効にする",
-            key=_tf_show_ss_key,
-            on_change=_auto_save_setting,
-            args=(ticker, "show_timeframe_diagnosis"),
-            help="ONにすると次回読み込み時も診断セクションが開いた状態で表示されます。設定は自動保存されます。",
-        )
-        if not st.session_state[_tf_show_ss_key]:
-            _tf_col2.caption("トグルをONにすると診断を利用できます")
-        else:
+        # ─── 時間軸適合診断（アクティブ銘柄のみ）───
+        if _s.get("show_timeframe_diagnosis", False):
+            st.divider()
+            _tf_key = f"tf_result_{ticker}_{period}"
+            _tf_cname = _get_company_name(ticker)
+            _tf_cname_str = f"  {_tf_cname}" if _tf_cname != ticker else ""
+            st.subheader(f"🕐 時間軸適合診断: {ticker}{_tf_cname_str}")
             st.caption(
                 "4種類のMA設定（超短期〜長期）でバックテストを比較し、"
                 "この銘柄に適した時間軸とレジームを診断します。"
             )
-        if st.session_state[_tf_show_ss_key] and st.button("▶ 診断実行", key=f"run_tf_{ticker}"):
-            _tf_df = st.session_state.get(f"df_{ticker}", None)
-            if _tf_df is None:
-                try:
-                    _tf_df = get_stock_data(ticker, period=period)
-                except Exception as _e:
-                    st.error(f"データ取得エラー: {_e}")
-                    _tf_df = None
-            if _tf_df is not None:
-                with st.spinner("各MA設定でバックテスト実行中..."):
-                    _tf_s = _get_ticker_settings(ticker)
-                    _tf_ic = _tf_s.get("initial_cash", 1_000_000)
-                    st.session_state[_tf_key] = analyze_timeframe(_tf_df, initial_cash=_tf_ic)
+            if st.button("▶ 診断実行", key=f"run_tf_{ticker}"):
+                _tf_df = st.session_state.get(f"df_{ticker}", None)
+                if _tf_df is None:
+                    try:
+                        _tf_df = get_stock_data(ticker, period=period)
+                    except Exception as _e:
+                        st.error(f"データ取得エラー: {_e}")
+                        _tf_df = None
+                if _tf_df is not None:
+                    with st.spinner("各MA設定でバックテスト実行中..."):
+                        _tf_ic = _s.get("initial_cash", 1_000_000)
+                        st.session_state[_tf_key] = analyze_timeframe(_tf_df, initial_cash=_tf_ic)
 
-        tf_res = st.session_state.get(_tf_key) if st.session_state[_tf_show_ss_key] else None
-        if tf_res:
-            if "error" in tf_res:
-                st.error(tf_res["error"])
-            else:
-                # ── 総合判定 ──
-                regime = tf_res["regime"]
-                best = tf_res["best_combined"]
-                rlabel = tf_res["regime_label"]
-                dom = regime["dominant"]
-                badge = "📈" if dom == "SHORT_TERM" else ("📉" if dom == "LONG_TERM" else "↔️")
+            tf_res = st.session_state.get(_tf_key)
+            if tf_res:
+                if "error" in tf_res:
+                    st.error(tf_res["error"])
+                else:
+                    # ── 総合判定 ──
+                    regime = tf_res["regime"]
+                    best = tf_res["best_combined"]
+                    rlabel = tf_res["regime_label"]
+                    dom = regime["dominant"]
+                    badge = "📈" if dom == "SHORT_TERM" else ("📉" if dom == "LONG_TERM" else "↔️")
 
-                _rc1, _rc2, _rc3 = st.columns([1, 2, 1])
-                _rc1.metric("レジーム判定", f"{badge} {rlabel}")
-                _rc2.metric(
-                    "推奨MA設定",
-                    best["label"],
-                    f"リターン {best['return_pct']:+.2f}% / PF {best['profit_factor']:.2f}",
-                )
-                if _rc3.button(
-                    "⭐ この設定を適用",
-                    key=f"apply_tf_{ticker}",
-                    type="primary",
-                    help=f"短期MA={best['short']} / 長期MA={best['long']} をこの銘柄に適用してDBに保存します",
-                ):
-                    _pfx = f"cfg_{ticker}"
-                    # 現在のセッション状態（extra_checkedを除く全設定）を取得してMAだけ上書き
-                    _apply_s = {
-                        _k: st.session_state.get(f"{_pfx}_{_k}", db.DEFAULT_SETTINGS[_k])
-                        for _k in db.DEFAULT_SETTINGS if _k != "extra_checked"
+                    _rc1, _rc2, _rc3 = st.columns([1, 2, 1])
+                    _rc1.metric("レジーム判定", f"{badge} {rlabel}")
+                    _rc2.metric(
+                        "推奨MA設定",
+                        best["label"],
+                        f"リターン {best['return_pct']:+.2f}% / PF {best['profit_factor']:.2f}",
+                    )
+                    if _rc3.button(
+                        "⭐ この設定を適用",
+                        key=f"apply_tf_{ticker}",
+                        type="primary",
+                        help=f"短期MA={best['short']} / 長期MA={best['long']} をこの銘柄に適用してDBに保存します",
+                    ):
+                        _pfx = f"cfg_{ticker}"
+                        _apply_s = {
+                            _k: st.session_state.get(f"{_pfx}_{_k}", db.DEFAULT_SETTINGS[_k])
+                            for _k in db.DEFAULT_SETTINGS if _k != "extra_checked"
+                        }
+                        _apply_s["ma_short"] = best["short"]
+                        _apply_s["ma_long"]  = best["long"]
+                        _apply_s["use_ma"]   = True
+                        _apply_s["extra_checked"] = [
+                            _cn
+                            for _, _grp in _SIDEBAR_EXTRA_GROUPS
+                            for _, _cn in _grp
+                            if st.session_state.get(f"{_pfx}_ext_{_cn}", False)
+                        ]
+                        db.save_settings(ticker, _apply_s)
+                        st.session_state.pop(f"_cfg_init_{ticker}", None)
+                        for _ck in [k for k in list(st.session_state.keys())
+                                    if ticker in k and any(k.startswith(p) for p in
+                                       ("df_", "bt_summary_", "opt_", "corr_cache_", "df_ext_"))]:
+                            st.session_state.pop(_ck, None)
+                        st.success(f"MA設定を適用しました（短期={best['short']} / 長期={best['long']}）")
+                        st.rerun()
+
+                    # ── MA設定別バックテスト比較表 ──
+                    st.markdown("**MA設定別バックテスト比較**")
+                    _cfg_rows = []
+                    for c in tf_res["configs"]:
+                        is_best = c["label"] == best["label"]
+                        _cfg_rows.append({
+                            "MA設定":     ("★ " if is_best else "") + c["label"],
+                            "リターン(%)": c["return_pct"],
+                            "勝率(%)":    c["win_rate_pct"],
+                            "取引回数":   c["trade_count"],
+                            "PF":         c["profit_factor"],
+                            "最大DD(%)":  c["max_dd_pct"],
+                        })
+                    _cfg_df = pd.DataFrame(_cfg_rows)
+
+                    def _color_return(val):
+                        if isinstance(val, float):
+                            return f"color: {'#00cc66' if val > 0 else '#ff4444'}"
+                        return ""
+
+                    st.dataframe(
+                        _cfg_df.style.map(_color_return, subset=["リターン(%)", "最大DD(%)"]),
+                        hide_index=True,
+                        width="stretch",
+                    )
+
+                    # ── レジームスコア詳細 ──
+                    st.markdown("**レジームスコア詳細**")
+                    _score_rows = []
+                    _label_map = {
+                        "ma_cross":      "MAクロス頻度",
+                        "bb_width":      "BB幅変動",
+                        "rsi_behavior":  "RSI挙動",
+                        "macd_behavior": "MACDゼロライン",
                     }
-                    _apply_s["ma_short"] = best["short"]
-                    _apply_s["ma_long"]  = best["long"]
-                    _apply_s["use_ma"]   = True
-                    _apply_s["extra_checked"] = [
-                        _cn
-                        for _, _grp in _SIDEBAR_EXTRA_GROUPS
-                        for _, _cn in _grp
-                        if st.session_state.get(f"{_pfx}_ext_{_cn}", False)
-                    ]
-                    db.save_settings(ticker, _apply_s)
-                    # サイドバー初期化キーを削除 → 次回レンダリングでDBから再読み込みさせる
-                    st.session_state.pop(f"_cfg_init_{ticker}", None)
-                    # シグナル・バックテストキャッシュを無効化
-                    for _ck in [k for k in list(st.session_state.keys())
-                                if ticker in k and any(k.startswith(p) for p in
-                                   ("df_", "bt_summary_", "opt_", "corr_cache_", "df_ext_"))]:
-                        st.session_state.pop(_ck, None)
-                    st.success(f"MA設定を適用しました（短期={best['short']} / 長期={best['long']}）")
-                    st.rerun()
-
-                # ── MA設定別バックテスト比較表 ──
-                st.markdown("**MA設定別バックテスト比較**")
-                _cfg_rows = []
-                for c in tf_res["configs"]:
-                    is_best = c["label"] == best["label"]
-                    _cfg_rows.append({
-                        "MA設定":     ("★ " if is_best else "") + c["label"],
-                        "リターン(%)": c["return_pct"],
-                        "勝率(%)":    c["win_rate_pct"],
-                        "取引回数":   c["trade_count"],
-                        "PF":         c["profit_factor"],
-                        "最大DD(%)":  c["max_dd_pct"],
-                    })
-                _cfg_df = pd.DataFrame(_cfg_rows)
-
-                def _color_return(val):
-                    if isinstance(val, float):
-                        return f"color: {'#00cc66' if val > 0 else '#ff4444'}"
-                    return ""
-
-                st.dataframe(
-                    _cfg_df.style.map(_color_return, subset=["リターン(%)", "最大DD(%)"]),
-                    hide_index=True,
-                    width="stretch",
-                )
-
-                # ── レジームスコア詳細 ──
-                st.markdown("**レジームスコア詳細**")
-                _score_rows = []
-                _label_map = {
-                    "ma_cross":      "MAクロス頻度",
-                    "bb_width":      "BB幅変動",
-                    "rsi_behavior":  "RSI挙動",
-                    "macd_behavior": "MACDゼロライン",
-                }
-                for k, v in regime["details"].items():
+                    for k, v in regime["details"].items():
+                        _score_rows.append({
+                            "指標":       _label_map.get(k, k),
+                            "短期スコア": v["short"],
+                            "長期スコア": v["long"],
+                            "詳細":       v["desc"],
+                        })
                     _score_rows.append({
-                        "指標":       _label_map.get(k, k),
-                        "短期スコア": v["short"],
-                        "長期スコア": v["long"],
-                        "詳細":       v["desc"],
+                        "指標": "合計",
+                        "短期スコア": regime["short_score"],
+                        "長期スコア": regime["long_score"],
+                        "詳細": f"最大{regime['max_score']}点",
                     })
-                _score_rows.append({
-                    "指標": "合計",
-                    "短期スコア": regime["short_score"],
-                    "長期スコア": regime["long_score"],
-                    "詳細": f"最大{regime['max_score']}点",
-                })
-                st.dataframe(pd.DataFrame(_score_rows), hide_index=True, width="stretch")
+                    st.dataframe(pd.DataFrame(_score_rows), hide_index=True, width="stretch")
 
-                st.caption(
-                    "⚠️ この診断は過去データに基づく参考値です。"
-                    " 相場の状態は変化するため、定期的に再診断してください。"
-                )
+                    st.caption(
+                        "⚠️ この診断は過去データに基づく参考値です。"
+                        " 相場の状態は変化するため、定期的に再診断してください。"
+                    )
 
 # ─────────────────────────────────────────────
 # フッター
