@@ -751,10 +751,17 @@ def _refresh_portfolio_summaries(tickers: list[str], period: str) -> None:
             st.session_state[f"bt_summary_{t}"] = {
                 "initial_cash": _res["initial_cash"],
                 "final_value": _res["final_value"],
+                "total_return_pct": _res["total_return_pct"],
+                "current_position": _res["current_position"],
             }
 
 
 _ensure_ticker_items()
+
+# DBから取得期間を先読みしてsession_stateにセット
+# （サイドバー描画前にbt_summary_を正しい期間で計算するために必要）
+if "_period" not in st.session_state:
+    st.session_state["_period"] = db.load_global_settings().get("period", "1y")
 
 # サイドバーの「ポートフォリオサマリー」が1レンダリング遅れないよう、
 # bt_summary_ が未作成の銘柄だけ事前に計算しておく
@@ -1368,13 +1375,11 @@ for _ni, (_nc, _nt) in enumerate(zip(_nav_cols, tickers)):
         st.session_state.active_ticker = _nt
         st.rerun()
 
-# ── 右パネル：アクティブ銘柄のファンダメンタル情報を固定表示 ──
-if not st.session_state.get("_show_right_panel", True):
-    st.markdown(
-        "<style>.main .block-container { padding-right: 1rem !important; }</style>",
-        unsafe_allow_html=True,
-    )
-_panel_ticker = st.session_state.get("active_ticker", tickers[0] if tickers else "") if st.session_state.get("_show_right_panel", True) else None
+# ── 下部パネル：アクティブ銘柄のファンダメンタル情報を固定表示 ──
+_panel_ticker = (
+    st.session_state.get("active_ticker", tickers[0] if tickers else "")
+    if st.session_state.get("_show_right_panel", True) else None
+)
 if _panel_ticker:
     _pd = get_fundamental_data_cached(_panel_ticker)
     _pfs = _get_fund_settings(_panel_ticker)
@@ -1395,25 +1400,89 @@ if _panel_ticker:
         return f"{v:.1f}{unit}" if v is not None else "—"
 
     _score_color = "#00ff88" if _pscore >= 2 else ("#ff4060" if _pscore <= -2 else "#8892a4")
-    _edinet_html = ""
-    if _pedinet:
-        _edinet_html = f"""
-        <div style='margin-top:10px;padding-top:8px;border-top:1px solid #1e2d40'>
-            <div style='font-size:0.7rem;color:#00d4ff;font-weight:600;margin-bottom:4px'>📄 EDINET</div>
-            <div style='font-size:0.68rem;color:#aaa;line-height:1.4'>{_pedinet.get('docDescription','—')}</div>
-            <div style='font-size:0.65rem;color:#666;margin-top:2px'>提出: {str(_pedinet.get('submitDateTime',''))[:10]}</div>
-        </div>"""
+    _pname = get_company_name(_panel_ticker)
 
+    # ── 会社情報タイル ──
+    _ci_html = (
+        "<div style='flex-shrink:0;padding-right:16px;border-right:1px solid #1e2d40;min-width:100px'>"
+        "<div style='font-size:0.6rem;color:#00d4ff;font-weight:700;margin-bottom:3px'>&#x1F4CA; 基本情報</div>"
+        f"<div style='font-size:0.7rem;color:#e8eaf0;font-weight:600;max-width:120px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap'>{_pname}</div>"
+        f"<div style='font-size:0.58rem;color:#888'>{_panel_ticker}</div>"
+        f"<div style='font-size:0.65rem;color:{_score_color};font-weight:600;margin-top:2px'>スコア: {_pscore:+d}</div>"
+        "</div>"
+    )
+
+    # ── ポートフォリオタイル ──
+    _pbts = st.session_state.get(f"bt_summary_{_panel_ticker}", {})
+    _pf_html = ""
+    if _pbts:
+        _pic    = _pbts.get("initial_cash", 0)
+        _pfv    = _pbts.get("final_value", 0)
+        _pprofit = _pfv - _pic
+        _pretpct = _pbts.get("total_return_pct", 0.0)
+        _ppos   = _pbts.get("current_position", 0)
+        _pc     = "#00ff88" if _pprofit >= 0 else "#ff4060"
+        _psign  = "+" if _pprofit >= 0 else ""
+        _pf_items = [
+            ("初期投資額",   f"{_pic:,.0f}円",              "#e8eaf0", ""),
+            ("現在の評価額", f"{_pfv:,.0f}円",              "#e8eaf0", ""),
+            ("損益合計",     f"{_psign}{_pprofit:,.0f}円",  _pc,       "font-weight:600"),
+            ("リターン率",   f"{_pretpct:+.2f}%",           _pc,       "font-weight:600"),
+            ("保有株式数",   f"{_ppos:,}株",                "#e8eaf0", ""),
+        ]
+        _pf_tiles = "".join(
+            f"<div style='text-align:center;padding:0 8px;border-right:1px solid #1a2236'>"
+            f"<div style='font-size:0.58rem;color:#8892a4;margin-bottom:1px'>{lbl}</div>"
+            f"<div style='font-size:0.68rem;color:{col};{xtra}'>{val}</div>"
+            f"</div>"
+            for lbl, val, col, xtra in _pf_items
+        )
+        _pf_html = (
+            "<div style='flex-shrink:0;padding-right:16px;border-right:1px solid #1e2d40'>"
+            "<div style='font-size:0.6rem;color:#f0c040;font-weight:600;margin-bottom:3px'>&#x1F4B0; ポートフォリオ</div>"
+            "<div style='display:flex;align-items:center'>" + _pf_tiles + "</div>"
+            "</div>"
+        )
+
+    # ── ファンダメンタルタイル ──
     _panel_rows = [
-        ("PER", "per",        "倍"),
-        ("PBR", "pbr",        "倍"),
-        ("ROE", "roe",        "%"),
-        ("ROA", "roa",        "%"),
+        ("PER",    "per",        "倍"),
+        ("PBR",    "pbr",        "倍"),
+        ("ROE",    "roe",        "%"),
+        ("ROA",    "roa",        "%"),
         ("EPS成長", "eps_growth", "%"),
         ("売上成長", "rev_growth", "%"),
-        ("営業利益率", "op_margin",  "%"),
+        ("営業利益率", "op_margin", "%"),
         ("負債比率",  "debt_ratio", ""),
     ]
+    _fund_tiles = "".join(
+        f"<div style='text-align:center;padding:0 8px;border-right:1px solid #1a2236'>"
+        f"<div style='font-size:0.58rem;color:#8892a4;margin-bottom:1px'>{lbl}</div>"
+        f"<div style='font-size:0.65rem;color:#e8eaf0'>{_sig_icon(key)} {_fmt(key, unit)}</div>"
+        f"</div>"
+        for lbl, key, unit in _panel_rows
+    )
+    _fund_html = (
+        "<div style='flex-shrink:0"
+        + (";padding-right:16px;border-right:1px solid #1e2d40" if _pedinet else "")
+        + "'>"
+        "<div style='font-size:0.6rem;color:#00d4ff;font-weight:600;margin-bottom:3px'>ファンダメンタル</div>"
+        "<div style='display:flex;align-items:center'>" + _fund_tiles + "</div>"
+        "</div>"
+    )
+
+    # ── EDINETタイル ──
+    _edinet_html = ""
+    if _pedinet:
+        _edinet_html = (
+            "<div style='flex-shrink:0;padding-left:4px'>"
+            "<div style='font-size:0.6rem;color:#00d4ff;font-weight:600;margin-bottom:3px'>&#x1F4C4; EDINET</div>"
+            f"<div style='font-size:0.62rem;color:#aaa;max-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap'>{_pedinet.get('docDescription', '—')}</div>"
+            f"<div style='font-size:0.58rem;color:#666;margin-top:1px'>提出: {str(_pedinet.get('submitDateTime', ''))[:10]}</div>"
+            "</div>"
+        )
+
+    # ── 縦並びパネルのrows HTML ──
     _rows_html = "".join(
         f"<div style='display:flex;justify-content:space-between;align-items:center;"
         f"padding:3px 0;border-bottom:1px solid #1a2236'>"
@@ -1422,38 +1491,54 @@ if _panel_ticker:
         f"</div>"
         for lbl, key, unit in _panel_rows
     )
-    _pname = get_company_name(_panel_ticker)
-    _panel_html = f"""
-<div id="fund-right-panel" style="
-    position: fixed;
-    right: 12px;
-    top: 60px;
-    width: 190px;
-    background: #0d1321;
-    border: 1px solid #1e2d40;
-    border-radius: 10px;
-    padding: 12px;
-    z-index: 9999;
-    max-height: calc(100vh - 80px);
-    overflow-y: auto;
-    box-shadow: 0 4px 20px rgba(0,0,0,0.5);
-">
-    <div style='font-size:0.7rem;color:#00d4ff;font-weight:700;letter-spacing:0.04em;margin-bottom:6px'>📊 基本情報</div>
-    <div style='font-size:0.78rem;color:#e8eaf0;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis'>{_pname}</div>
-    <div style='font-size:0.65rem;color:#666;margin-bottom:6px'>{_panel_ticker}</div>
-    <div style='font-size:0.7rem;color:{_score_color};font-weight:600;margin-bottom:8px'>
-        総合スコア: {_pscore:+d}
-    </div>
-    {_rows_html}
-    {_edinet_html}
-</div>
-<style>
-/* 右パネル分のメインコンテンツ余白 */
-.main .block-container {{
-    padding-right: 215px !important;
-}}
-</style>
-"""
+
+    # ── ポートフォリオ縦並びHTML ──
+    _portfolio_html = ""
+    if _pbts:
+        _pf_items = [
+            ("初期投資額",   f"{_pic:,.0f}円",              "#e8eaf0", ""),
+            ("現在の評価額", f"{_pfv:,.0f}円",              "#e8eaf0", ""),
+            ("損益合計",     f"{_psign}{_pprofit:,.0f}円",  _pc,       "font-weight:600"),
+            ("リターン率",   f"{_pretpct:+.2f}%",           _pc,       "font-weight:600"),
+            ("保有株式数",   f"{_ppos:,}株",                "#e8eaf0", ""),
+        ]
+        _pf_rows_html = "".join(
+            f"<div style='display:flex;justify-content:space-between;padding:2px 0;"
+            f"border-bottom:{'1px solid #1a2236' if i < len(_pf_items) - 1 else 'none'}'>"
+            f"<span style='font-size:0.65rem;color:#8892a4'>{lbl}</span>"
+            f"<span style='font-size:0.68rem;color:{col};{xtra}'>{val}</span>"
+            f"</div>"
+            for i, (lbl, val, col, xtra) in enumerate(_pf_items)
+        )
+        _portfolio_html = (
+            "<div style='margin-top:8px;padding-top:8px;border-top:1px solid #1e2d40;margin-bottom:8px'>"
+            "<div style='font-size:0.7rem;color:#f0c040;font-weight:600;margin-bottom:4px'>&#x1F4B0; ポートフォリオ</div>"
+            + _pf_rows_html
+            + "</div>"
+        )
+
+    _panel_html = (
+        "<div id='fund-right-panel' style='"
+        "position:fixed;right:12px;bottom:12px;"
+        "width:200px;background:#0d1321;"
+        "border:1px solid #1e2d40;border-radius:10px;"
+        "padding:12px;z-index:9999;"
+        "max-height:70vh;overflow-y:auto;"
+        "box-shadow:0 4px 20px rgba(0,0,0,0.5);"
+        "'>"
+        "<div style='font-size:0.7rem;color:#00d4ff;font-weight:700;letter-spacing:0.04em;margin-bottom:6px'>&#x1F4CA; 基本情報</div>"
+        f"<div style='font-size:0.78rem;color:#e8eaf0;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis'>{_pname}</div>"
+        f"<div style='font-size:0.65rem;color:#666;margin-bottom:6px'>{_panel_ticker}</div>"
+        f"<div style='font-size:0.7rem;color:{_score_color};font-weight:600;margin-bottom:4px'>総合スコア: {_pscore:+d}</div>"
+        + _portfolio_html
+        + _rows_html
+        + _edinet_html
+        + "</div>"
+        "<style>"
+        "[data-testid='stPlotlyChart'] { width: calc(100% - 220px) !important; }"
+        ".main .block-container { padding-right: 220px !important; }"
+        "</style>"
+    )
     st.markdown(_panel_html, unsafe_allow_html=True)
 
 for ticker in tickers:
@@ -1561,6 +1646,8 @@ for ticker in tickers:
         st.session_state[f"bt_summary_{ticker}"] = {
             "initial_cash": result["initial_cash"],
             "final_value":  result["final_value"],
+            "total_return_pct": result["total_return_pct"],
+            "current_position": result["current_position"],
         }
 
         # ─── メトリクス ───
@@ -1611,12 +1698,12 @@ for ticker in tickers:
         fig = create_chart(df, ticker, ic,
                            ext_overlays=_chart_ext_overlays,
                            ext_oscillators=_chart_ext_oscillators)
-        st.plotly_chart(fig, width="stretch")
+        st.plotly_chart(fig, use_container_width=True)
 
         # ─── ポートフォリオ推移 ───
         if not result["portfolio_curve"].empty:
             fig_pf = create_portfolio_chart(result["portfolio_curve"], initial_cash)
-            st.plotly_chart(fig_pf, width="stretch")
+            st.plotly_chart(fig_pf, use_container_width=True)
 
         # ─── 空売り・スクイーズ分析 ───
         _sp_danger  = _s.get("sell_pressure_danger",  0.50)
@@ -1702,7 +1789,7 @@ for ticker in tickers:
                     yaxis=dict(range=[0, 1]),
                     legend=dict(orientation="h", yanchor="top", y=-0.2, xanchor="center", x=0.5),
                 )
-                st.plotly_chart(fig_ss, width="stretch")
+                st.plotly_chart(fig_ss, use_container_width=True)
 
             st.caption(
                 "空売り圧力：大出来高を伴う下落の累積強度（0〜1）。"
@@ -1833,7 +1920,7 @@ for ticker in tickers:
                     lambda x: f"{x:+,.0f}円" if pd.notna(x) else "-"
                 )
                 trades_display.columns = ["日付", "種別", "株価", "株数", "損益"]
-                st.dataframe(trades_display, width="stretch", hide_index=True)
+                st.dataframe(trades_display, use_container_width=True, hide_index=True)
 
         # ─── 指標テーブル（直近10日）───
         with st.expander("指標データ（直近10日）"):
@@ -1850,7 +1937,178 @@ for ticker in tickers:
             available = [c for c in show_cols if c in df.columns]
             tail_df = df[available].tail(10).copy()
             tail_df.index = tail_df.index.strftime("%Y-%m-%d")
-            st.dataframe(tail_df.round(2), width="stretch")
+            st.dataframe(tail_df.round(2), use_container_width=True)
+
+
+        # ─── 拡張バックテスト結果 ───
+        ext_bt_state = st.session_state.get(f"ext_bt_{ticker}")
+        if ext_bt_state:
+            er = ext_bt_state["result"]
+            names_str = "、".join(ext_bt_state["names"][:5])
+            if len(ext_bt_state["names"]) > 5:
+                names_str += f" 他{len(ext_bt_state['names'])-5}件"
+
+            is_rec = ext_bt_state.get("is_recommended", False)
+            badge = " ⭐ 推奨組み合わせ" if is_rec else ""
+            st.subheader(f"🔁 拡張バックテスト結果（{names_str}）{badge}")
+
+            # 比較メトリクス
+            c1, c2, c3, c4 = st.columns(4)
+            delta_ret = er["total_return_pct"] - ret_pct
+            delta_dd  = er["max_drawdown_pct"] - result["max_drawdown_pct"]
+            delta_win = er["win_rate_pct"] - result["win_rate_pct"]
+            delta_tr  = len(er["trades"]) - trade_count
+
+            c1.metric("リターン（新）",  f"{er['total_return_pct']:.2f}%",  f"{delta_ret:+.2f}% vs 元")
+            c2.metric("最大DD（新）",    f"{er['max_drawdown_pct']:.2f}%",  f"{delta_dd:+.2f}% vs 元")
+            c3.metric("勝率（新）",      f"{er['win_rate_pct']:.1f}%",      f"{delta_win:+.1f}% vs 元")
+            c4.metric("取引回数（新）",  f"{len(er['trades'])}回",          f"{delta_tr:+d}回 vs 元")
+
+            # ポートフォリオ推移比較
+            if not er["portfolio_curve"].empty and not result["portfolio_curve"].empty:
+                fig_cmp = create_comparison_chart(
+                    result["portfolio_curve"], er["portfolio_curve"],
+                    "元の指標", f"拡張指標（{len(ext_bt_state['checked'])}種）",
+                    initial_cash,
+                )
+                st.plotly_chart(fig_cmp, use_container_width=True)
+
+            # 取引履歴（拡張）
+            if not er["trades"].empty:
+                with st.expander(f"拡張バックテスト取引履歴（{len(er['trades'])}件）"):
+                    td = er["trades"].copy()
+                    td["date"]   = pd.to_datetime(td["date"]).dt.strftime("%Y-%m-%d")
+                    td["price"]  = td["price"].map("{:,.1f}円".format)
+                    td["profit"] = td["profit"].apply(lambda x: f"{x:+,.0f}円" if pd.notna(x) else "-")
+                    td.columns   = ["日付", "種別", "株価", "株数", "損益"]
+                    st.dataframe(td, use_container_width=True, hide_index=True)
+
+        # ─── 時間軸適合診断（アクティブ銘柄のみ）───
+        if _s.get("show_timeframe_diagnosis", False):
+            st.divider()
+            _tf_key = f"tf_result_{ticker}_{period}"
+            _tf_cname = _get_company_name(ticker)
+            _tf_cname_str = f"  {_tf_cname}" if _tf_cname != ticker else ""
+            st.subheader(f"🕐 時間軸適合診断: {ticker}{_tf_cname_str}")
+            st.caption(
+                "4種類のMA設定（超短期〜長期）でバックテストを比較し、"
+                "この銘柄に適した時間軸とレジームを診断します。"
+            )
+            if st.button("▶ 診断実行", key=f"run_tf_{ticker}"):
+                _tf_df = st.session_state.get(f"df_{ticker}", None)
+                if _tf_df is None:
+                    try:
+                        _tf_df = get_stock_data(ticker, period=period)
+                    except Exception as _e:
+                        st.error(f"データ取得エラー: {_e}")
+                        _tf_df = None
+                if _tf_df is not None:
+                    with st.spinner("各MA設定でバックテスト実行中..."):
+                        _tf_ic = _s.get("initial_cash", 1_000_000)
+                        st.session_state[_tf_key] = analyze_timeframe(_tf_df, initial_cash=_tf_ic)
+
+            tf_res = st.session_state.get(_tf_key)
+            if tf_res:
+                if "error" in tf_res:
+                    st.error(tf_res["error"])
+                else:
+                    # ── 総合判定 ──
+                    regime = tf_res["regime"]
+                    best = tf_res["best_combined"]
+                    rlabel = tf_res["regime_label"]
+                    dom = regime["dominant"]
+                    badge = "📈" if dom == "SHORT_TERM" else ("📉" if dom == "LONG_TERM" else "↔️")
+
+                    _rc1, _rc2, _rc3 = st.columns([1, 2, 1])
+                    _rc1.metric("レジーム判定", f"{badge} {rlabel}")
+                    _rc2.metric(
+                        "推奨MA設定",
+                        best["label"],
+                        f"リターン {best['return_pct']:+.2f}% / PF {best['profit_factor']:.2f}",
+                    )
+                    if _rc3.button(
+                        "⭐ この設定を適用",
+                        key=f"apply_tf_{ticker}",
+                        type="primary",
+                        help=f"短期MA={best['short']} / 長期MA={best['long']} をこの銘柄に適用してDBに保存します",
+                    ):
+                        _pfx = f"cfg_{ticker}"
+                        _apply_s = {
+                            _k: st.session_state.get(f"{_pfx}_{_k}", db.DEFAULT_SETTINGS[_k])
+                            for _k in db.DEFAULT_SETTINGS if _k != "extra_checked"
+                        }
+                        _apply_s["ma_short"] = best["short"]
+                        _apply_s["ma_long"]  = best["long"]
+                        _apply_s["use_ma"]   = True
+                        _apply_s["extra_checked"] = [
+                            _cn
+                            for _, _grp in _SIDEBAR_EXTRA_GROUPS
+                            for _, _cn in _grp
+                            if st.session_state.get(f"{_pfx}_ext_{_cn}", False)
+                        ]
+                        db.save_settings(ticker, _apply_s)
+                        st.session_state.pop(f"_cfg_init_{ticker}", None)
+                        for _ck in [k for k in list(st.session_state.keys())
+                                    if ticker in k and any(k.startswith(p) for p in
+                                       ("df_", "bt_summary_", "opt_", "corr_cache_", "df_ext_"))]:
+                            st.session_state.pop(_ck, None)
+                        st.success(f"MA設定を適用しました（短期={best['short']} / 長期={best['long']}）")
+                        st.rerun()
+
+                    # ── MA設定別バックテスト比較表 ──
+                    st.markdown("**MA設定別バックテスト比較**")
+                    _cfg_rows = []
+                    for c in tf_res["configs"]:
+                        is_best = c["label"] == best["label"]
+                        _cfg_rows.append({
+                            "MA設定":     ("★ " if is_best else "") + c["label"],
+                            "リターン(%)": c["return_pct"],
+                            "勝率(%)":    c["win_rate_pct"],
+                            "取引回数":   c["trade_count"],
+                            "PF":         c["profit_factor"],
+                            "最大DD(%)":  c["max_dd_pct"],
+                        })
+                    _cfg_df = pd.DataFrame(_cfg_rows)
+
+                    def _color_return(val):
+                        if isinstance(val, float):
+                            return f"color: {'#00cc66' if val > 0 else '#ff4444'}"
+                        return ""
+
+                    st.dataframe(
+                        _cfg_df.style.map(_color_return, subset=["リターン(%)", "最大DD(%)"]),
+                        hide_index=True,
+                        use_container_width=True,
+                    )
+
+                    # ── レジームスコア詳細 ──
+                    st.markdown("**レジームスコア詳細**")
+                    _score_rows = []
+                    _label_map = {
+                        "ma_cross":      "MAクロス頻度",
+                        "bb_width":      "BB幅変動",
+                        "rsi_behavior":  "RSI挙動",
+                        "macd_behavior": "MACDゼロライン",
+                    }
+                    for k, v in regime["details"].items():
+                        _score_rows.append({
+                            "指標":       _label_map.get(k, k),
+                            "短期スコア": v["short"],
+                            "長期スコア": v["long"],
+                            "詳細":       v["desc"],
+                        })
+                    _score_rows.append({
+                        "指標": "合計",
+                        "短期スコア": regime["short_score"],
+                        "長期スコア": regime["long_score"],
+                        "詳細": f"最大{regime['max_score']}点",
+                    })
+                    st.dataframe(pd.DataFrame(_score_rows), hide_index=True, use_container_width=True)
+
+                    st.caption(
+                        "⚠️ この診断は過去データに基づく参考値です。"
+                        " 相場の状態は変化するため、定期的に再診断してください。"
+                    )
 
         st.divider()
 
@@ -2014,176 +2272,6 @@ for ticker in tickers:
 
             else:
                 st.info("相関しきい値(0.15)以上の指標は見つかりませんでした。")
-
-        # ─── 拡張バックテスト結果 ───
-        ext_bt_state = st.session_state.get(f"ext_bt_{ticker}")
-        if ext_bt_state:
-            er = ext_bt_state["result"]
-            names_str = "、".join(ext_bt_state["names"][:5])
-            if len(ext_bt_state["names"]) > 5:
-                names_str += f" 他{len(ext_bt_state['names'])-5}件"
-
-            is_rec = ext_bt_state.get("is_recommended", False)
-            badge = " ⭐ 推奨組み合わせ" if is_rec else ""
-            st.subheader(f"🔁 拡張バックテスト結果（{names_str}）{badge}")
-
-            # 比較メトリクス
-            c1, c2, c3, c4 = st.columns(4)
-            delta_ret = er["total_return_pct"] - ret_pct
-            delta_dd  = er["max_drawdown_pct"] - result["max_drawdown_pct"]
-            delta_win = er["win_rate_pct"] - result["win_rate_pct"]
-            delta_tr  = len(er["trades"]) - trade_count
-
-            c1.metric("リターン（新）",  f"{er['total_return_pct']:.2f}%",  f"{delta_ret:+.2f}% vs 元")
-            c2.metric("最大DD（新）",    f"{er['max_drawdown_pct']:.2f}%",  f"{delta_dd:+.2f}% vs 元")
-            c3.metric("勝率（新）",      f"{er['win_rate_pct']:.1f}%",      f"{delta_win:+.1f}% vs 元")
-            c4.metric("取引回数（新）",  f"{len(er['trades'])}回",          f"{delta_tr:+d}回 vs 元")
-
-            # ポートフォリオ推移比較
-            if not er["portfolio_curve"].empty and not result["portfolio_curve"].empty:
-                fig_cmp = create_comparison_chart(
-                    result["portfolio_curve"], er["portfolio_curve"],
-                    "元の指標", f"拡張指標（{len(ext_bt_state['checked'])}種）",
-                    initial_cash,
-                )
-                st.plotly_chart(fig_cmp, width="stretch")
-
-            # 取引履歴（拡張）
-            if not er["trades"].empty:
-                with st.expander(f"拡張バックテスト取引履歴（{len(er['trades'])}件）"):
-                    td = er["trades"].copy()
-                    td["date"]   = pd.to_datetime(td["date"]).dt.strftime("%Y-%m-%d")
-                    td["price"]  = td["price"].map("{:,.1f}円".format)
-                    td["profit"] = td["profit"].apply(lambda x: f"{x:+,.0f}円" if pd.notna(x) else "-")
-                    td.columns   = ["日付", "種別", "株価", "株数", "損益"]
-                    st.dataframe(td, width="stretch", hide_index=True)
-
-        # ─── 時間軸適合診断（アクティブ銘柄のみ）───
-        if _s.get("show_timeframe_diagnosis", False):
-            st.divider()
-            _tf_key = f"tf_result_{ticker}_{period}"
-            _tf_cname = _get_company_name(ticker)
-            _tf_cname_str = f"  {_tf_cname}" if _tf_cname != ticker else ""
-            st.subheader(f"🕐 時間軸適合診断: {ticker}{_tf_cname_str}")
-            st.caption(
-                "4種類のMA設定（超短期〜長期）でバックテストを比較し、"
-                "この銘柄に適した時間軸とレジームを診断します。"
-            )
-            if st.button("▶ 診断実行", key=f"run_tf_{ticker}"):
-                _tf_df = st.session_state.get(f"df_{ticker}", None)
-                if _tf_df is None:
-                    try:
-                        _tf_df = get_stock_data(ticker, period=period)
-                    except Exception as _e:
-                        st.error(f"データ取得エラー: {_e}")
-                        _tf_df = None
-                if _tf_df is not None:
-                    with st.spinner("各MA設定でバックテスト実行中..."):
-                        _tf_ic = _s.get("initial_cash", 1_000_000)
-                        st.session_state[_tf_key] = analyze_timeframe(_tf_df, initial_cash=_tf_ic)
-
-            tf_res = st.session_state.get(_tf_key)
-            if tf_res:
-                if "error" in tf_res:
-                    st.error(tf_res["error"])
-                else:
-                    # ── 総合判定 ──
-                    regime = tf_res["regime"]
-                    best = tf_res["best_combined"]
-                    rlabel = tf_res["regime_label"]
-                    dom = regime["dominant"]
-                    badge = "📈" if dom == "SHORT_TERM" else ("📉" if dom == "LONG_TERM" else "↔️")
-
-                    _rc1, _rc2, _rc3 = st.columns([1, 2, 1])
-                    _rc1.metric("レジーム判定", f"{badge} {rlabel}")
-                    _rc2.metric(
-                        "推奨MA設定",
-                        best["label"],
-                        f"リターン {best['return_pct']:+.2f}% / PF {best['profit_factor']:.2f}",
-                    )
-                    if _rc3.button(
-                        "⭐ この設定を適用",
-                        key=f"apply_tf_{ticker}",
-                        type="primary",
-                        help=f"短期MA={best['short']} / 長期MA={best['long']} をこの銘柄に適用してDBに保存します",
-                    ):
-                        _pfx = f"cfg_{ticker}"
-                        _apply_s = {
-                            _k: st.session_state.get(f"{_pfx}_{_k}", db.DEFAULT_SETTINGS[_k])
-                            for _k in db.DEFAULT_SETTINGS if _k != "extra_checked"
-                        }
-                        _apply_s["ma_short"] = best["short"]
-                        _apply_s["ma_long"]  = best["long"]
-                        _apply_s["use_ma"]   = True
-                        _apply_s["extra_checked"] = [
-                            _cn
-                            for _, _grp in _SIDEBAR_EXTRA_GROUPS
-                            for _, _cn in _grp
-                            if st.session_state.get(f"{_pfx}_ext_{_cn}", False)
-                        ]
-                        db.save_settings(ticker, _apply_s)
-                        st.session_state.pop(f"_cfg_init_{ticker}", None)
-                        for _ck in [k for k in list(st.session_state.keys())
-                                    if ticker in k and any(k.startswith(p) for p in
-                                       ("df_", "bt_summary_", "opt_", "corr_cache_", "df_ext_"))]:
-                            st.session_state.pop(_ck, None)
-                        st.success(f"MA設定を適用しました（短期={best['short']} / 長期={best['long']}）")
-                        st.rerun()
-
-                    # ── MA設定別バックテスト比較表 ──
-                    st.markdown("**MA設定別バックテスト比較**")
-                    _cfg_rows = []
-                    for c in tf_res["configs"]:
-                        is_best = c["label"] == best["label"]
-                        _cfg_rows.append({
-                            "MA設定":     ("★ " if is_best else "") + c["label"],
-                            "リターン(%)": c["return_pct"],
-                            "勝率(%)":    c["win_rate_pct"],
-                            "取引回数":   c["trade_count"],
-                            "PF":         c["profit_factor"],
-                            "最大DD(%)":  c["max_dd_pct"],
-                        })
-                    _cfg_df = pd.DataFrame(_cfg_rows)
-
-                    def _color_return(val):
-                        if isinstance(val, float):
-                            return f"color: {'#00cc66' if val > 0 else '#ff4444'}"
-                        return ""
-
-                    st.dataframe(
-                        _cfg_df.style.map(_color_return, subset=["リターン(%)", "最大DD(%)"]),
-                        hide_index=True,
-                        width="stretch",
-                    )
-
-                    # ── レジームスコア詳細 ──
-                    st.markdown("**レジームスコア詳細**")
-                    _score_rows = []
-                    _label_map = {
-                        "ma_cross":      "MAクロス頻度",
-                        "bb_width":      "BB幅変動",
-                        "rsi_behavior":  "RSI挙動",
-                        "macd_behavior": "MACDゼロライン",
-                    }
-                    for k, v in regime["details"].items():
-                        _score_rows.append({
-                            "指標":       _label_map.get(k, k),
-                            "短期スコア": v["short"],
-                            "長期スコア": v["long"],
-                            "詳細":       v["desc"],
-                        })
-                    _score_rows.append({
-                        "指標": "合計",
-                        "短期スコア": regime["short_score"],
-                        "長期スコア": regime["long_score"],
-                        "詳細": f"最大{regime['max_score']}点",
-                    })
-                    st.dataframe(pd.DataFrame(_score_rows), hide_index=True, width="stretch")
-
-                    st.caption(
-                        "⚠️ この診断は過去データに基づく参考値です。"
-                        " 相場の状態は変化するため、定期的に再診断してください。"
-                    )
 
 # ─────────────────────────────────────────────
 # フッター

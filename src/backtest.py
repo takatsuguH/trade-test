@@ -74,9 +74,9 @@ def run_backtest(
             )
             if can_rebuy:
                 invest_cash = cash * risk.max_position
-                shares = int(invest_cash // price)
+                shares = int(invest_cash // price // 100) * 100
                 if max_shares > 0:
-                    shares = min(shares, max_shares)
+                    shares = min(shares, int(max_shares // 100) * 100)
                 if shares > 0:
                     position = shares
                     buy_price = price
@@ -117,4 +117,5 @@ def run_backtest(
         "win_rate_pct": win_rate,
         "trades": trades_df,
         "portfolio_curve": pd.DataFrame(portfolio_curve),
+        "current_position": position,
     }
