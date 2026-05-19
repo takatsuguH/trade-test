@@ -84,6 +84,10 @@ DEFAULT_SETTINGS: dict = {
     # シグナル方式
     "use_context_strategy": False,
     "context_score_threshold": 5,
+    # ファンダメンタル統合
+    "fund_integrate": False,
+    # 時間軸適合診断の表示
+    "show_timeframe_diagnosis": False,
 }
 
 

@@ -559,6 +559,15 @@ def _get_company_name(ticker: str) -> str:
     return st.session_state[cache_key]
 
 
+def _auto_save_setting(ticker: str, setting_key: str) -> None:
+    """トグル変更時に単一設定をDBへ自動保存するコールバック。"""
+    pfx = f"cfg_{ticker}"
+    new_val = st.session_state.get(f"{pfx}_{setting_key}", db.DEFAULT_SETTINGS.get(setting_key))
+    saved = {**db.DEFAULT_SETTINGS, **db.load_settings(ticker)}
+    saved[setting_key] = new_val
+    db.save_settings(ticker, saved)
+
+
 def _get_ticker_settings(ticker: str) -> dict:
     """セッション状態（ライブ値）または DB から銘柄の設定を取得する。"""
     pfx = f"cfg_{ticker}"
@@ -693,7 +702,7 @@ def _prepare_ticker_df_and_backtest(
     _fund_result = calculate_fundamental_signals(_fund_data, _fund_settings)
     _fund_score = _fund_result["score"]
     _fund_count = _fund_result["enabled_count"]
-    _fund_integrate = st.session_state.get(f"fund_integrate_{ticker}", False)
+    _fund_integrate = _s.get("fund_integrate", False)
 
     if _fund_integrate and _fund_count > 0 and "vote_sum" in df.columns:
         _use_ctx = _s.get("use_context_strategy", False)
@@ -1514,7 +1523,7 @@ for ticker in tickers:
         _fund_score = _fund_result["score"]
         _fund_count = _fund_result["enabled_count"]
         _fund_signals = _fund_result["signals"]
-        _fund_integrate = st.session_state.get(f"fund_integrate_{ticker}", False)
+        _fund_integrate = _s.get("fund_integrate", False)
 
         # ── ファンダメンタル統合 ──
         # テクニカルの閾値は据え置き、fund_score を vote_sum への定数加算として扱う
@@ -1707,10 +1716,12 @@ for ticker in tickers:
             _fund_toggle_col1, _fund_toggle_col2 = st.columns([2, 3])
             _fund_toggle_col1.toggle(
                 "テクニカルシグナルに統合する",
-                key=f"fund_integrate_{ticker}",
+                key=f"cfg_{ticker}_fund_integrate",
+                on_change=_auto_save_setting,
+                args=(ticker, "fund_integrate"),
                 help=(
                     "ONにすると、ファンダメンタルスコアをテクニカル投票に加算して"
-                    "複合シグナルを決定します。変更はページ再描画後に反映されます。"
+                    "複合シグナルを決定します。設定は自動保存されます。"
                 ),
             )
             if _fund_integrate and _fund_count > 0:
@@ -2048,12 +2059,27 @@ for ticker in tickers:
     _tf_key = f"tf_result_{ticker}_{period}"
     _tf_cname = _get_company_name(ticker)
     _tf_title = f"🕐 時間軸適合診断: {ticker}" + (f"  {_tf_cname}" if _tf_cname != ticker else "")
-    with st.expander(_tf_title, expanded=False):
-        st.caption(
-            "4種類のMA設定（超短期〜長期）でバックテストを比較し、"
-            "この銘柄に適した時間軸とレジームを診断します。"
+    # show_timeframe_diagnosis がセッション未初期化の場合はDBから取得
+    _tf_show_ss_key = f"cfg_{ticker}_show_timeframe_diagnosis"
+    if _tf_show_ss_key not in st.session_state:
+        st.session_state[_tf_show_ss_key] = _get_ticker_settings(ticker).get("show_timeframe_diagnosis", False)
+    with st.expander(_tf_title, expanded=st.session_state[_tf_show_ss_key]):
+        _tf_col1, _tf_col2 = st.columns([3, 2])
+        _tf_col1.toggle(
+            "この銘柄の診断を有効にする",
+            key=_tf_show_ss_key,
+            on_change=_auto_save_setting,
+            args=(ticker, "show_timeframe_diagnosis"),
+            help="ONにすると次回読み込み時も診断セクションが開いた状態で表示されます。設定は自動保存されます。",
         )
-        if st.button("▶ 診断実行", key=f"run_tf_{ticker}"):
+        if not st.session_state[_tf_show_ss_key]:
+            _tf_col2.caption("トグルをONにすると診断を利用できます")
+        else:
+            st.caption(
+                "4種類のMA設定（超短期〜長期）でバックテストを比較し、"
+                "この銘柄に適した時間軸とレジームを診断します。"
+            )
+        if st.session_state[_tf_show_ss_key] and st.button("▶ 診断実行", key=f"run_tf_{ticker}"):
             _tf_df = st.session_state.get(f"df_{ticker}", None)
             if _tf_df is None:
                 try:
@@ -2067,7 +2093,7 @@ for ticker in tickers:
                     _tf_ic = _tf_s.get("initial_cash", 1_000_000)
                     st.session_state[_tf_key] = analyze_timeframe(_tf_df, initial_cash=_tf_ic)
 
-        tf_res = st.session_state.get(_tf_key)
+        tf_res = st.session_state.get(_tf_key) if st.session_state[_tf_show_ss_key] else None
         if tf_res:
             if "error" in tf_res:
                 st.error(tf_res["error"])
