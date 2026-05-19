@@ -1,6 +1,7 @@
 """SQLite-backed persistent storage for stocks and per-ticker indicator settings."""
 import sqlite3
 import json
+from datetime import datetime
 from pathlib import Path
 
 DB_PATH = Path("trade_settings.db")
@@ -87,7 +88,12 @@ DEFAULT_SETTINGS: dict = {
     # ファンダメンタル統合
     "fund_integrate": False,
     # 時間軸適合診断の表示
-    "show_timeframe_diagnosis": False,
+    "show_timeframe_diagnosis": True,
+    # RSI閾値適合診断の表示
+    "show_rsi_diagnosis": True,
+    # RSI閾値診断で選択されたプリセット (ob/os)
+    "rsi_diag_ob": 70,
+    "rsi_diag_os": 30,
 }
 
 
@@ -124,6 +130,14 @@ def init_db() -> None:
                 sec_code TEXT PRIMARY KEY,
                 doc_json TEXT NOT NULL,
                 updated_at TEXT DEFAULT (datetime('now','localtime'))
+            );
+            CREATE TABLE IF NOT EXISTS diagnosis_cache (
+                stock_code  TEXT NOT NULL,
+                diag_type   TEXT NOT NULL,
+                data_period TEXT NOT NULL,
+                result_json TEXT NOT NULL,
+                updated_at  TEXT DEFAULT (datetime('now','localtime')),
+                PRIMARY KEY (stock_code, diag_type, data_period)
             );
         """)
 
@@ -221,3 +235,33 @@ def save_edinet_cache(sec_code: str, doc: dict) -> None:
             INSERT OR REPLACE INTO edinet_cache (sec_code, doc_json, updated_at)
             VALUES (?, ?, datetime('now','localtime'))
         """, (sec_code, json.dumps(doc, ensure_ascii=False)))
+
+
+# ── 診断キャッシュ ──────────────────────────────────────────────────────────
+
+def load_diagnosis_cache(stock_code: str, diag_type: str, data_period: str) -> dict | None:
+    """当日更新済みの診断キャッシュを返す。なければ None。結果に _cached_at (HH:MM) を付与。"""
+    with _conn() as conn:
+        row = conn.execute(
+            """SELECT result_json, updated_at FROM diagnosis_cache
+               WHERE stock_code = ? AND diag_type = ? AND data_period = ?""",
+            (stock_code, diag_type, data_period),
+        ).fetchone()
+    if row is None:
+        return None
+    if row["updated_at"][:10] != datetime.now().strftime("%Y-%m-%d"):
+        return None
+    result = json.loads(row["result_json"])
+    result["_cached_at"] = row["updated_at"][11:16]  # "HH:MM"
+    return result
+
+
+def save_diagnosis_cache(stock_code: str, diag_type: str, data_period: str, result: dict) -> None:
+    """診断結果をDBに保存する（_cached_at などのメタキーは除去して保存）。"""
+    clean = {k: v for k, v in result.items() if not k.startswith("_")}
+    with _conn() as conn:
+        conn.execute("""
+            INSERT OR REPLACE INTO diagnosis_cache
+                (stock_code, diag_type, data_period, result_json, updated_at)
+            VALUES (?, ?, ?, ?, datetime('now','localtime'))
+        """, (stock_code, diag_type, data_period, json.dumps(clean, ensure_ascii=False)))

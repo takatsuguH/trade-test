@@ -77,26 +77,32 @@ class IndicatorEvaluator:
         return score
 
     @staticmethod
-    def evaluate_RSI(df: pd.DataFrame, market_state: pd.Series) -> pd.Series:
+    def evaluate_RSI(
+        df: pd.DataFrame,
+        market_state: pd.Series,
+        rsi_ob: int = 70,
+        rsi_os: int = 30,
+    ) -> pd.Series:
         """エントリータイミング役割：相場状態別 RSI → ±2"""
         score = pd.Series(0, index=df.index, dtype=float)
         if "RSI" not in df.columns:
             return score
 
         rsi_diff = df["RSI"].diff().fillna(0)
+        mid = (rsi_ob + rsi_os) / 2  # 50相当の中間値
 
-        # TREND_UP：RSI 40-50 で反発 → BUY
-        mask_up = (market_state == "TREND_UP") & df["RSI"].between(40, 50) & (rsi_diff > 0)
+        # TREND_UP：RSI mid-5 〜 mid+5 で反発 → BUY
+        mask_up = (market_state == "TREND_UP") & df["RSI"].between(mid - 5, mid + 5) & (rsi_diff > 0)
         score[mask_up] = 2.0
 
-        # TREND_DOWN：RSI 50-60 で反落 → SELL
-        mask_down = (market_state == "TREND_DOWN") & df["RSI"].between(50, 60) & (rsi_diff < 0)
+        # TREND_DOWN：RSI mid 〜 mid+10 で反落 → SELL
+        mask_down = (market_state == "TREND_DOWN") & df["RSI"].between(mid, mid + 10) & (rsi_diff < 0)
         score[mask_down] = -2.0
 
         # RANGE：過売 → BUY、過買 → SELL
         mask_range = market_state == "RANGE"
-        score[mask_range & (df["RSI"] < 30)] = 2.0
-        score[mask_range & (df["RSI"] > 70)] = -2.0
+        score[mask_range & (df["RSI"] < rsi_os)] = 2.0
+        score[mask_range & (df["RSI"] > rsi_ob)] = -2.0
 
         return score
 
@@ -148,15 +154,19 @@ class StrategyEngine:
 
     @staticmethod
     def apply_forbidden_rules(
-        signal: pd.Series, df: pd.DataFrame, market_state: pd.Series
+        signal: pd.Series,
+        df: pd.DataFrame,
+        market_state: pd.Series,
+        rsi_ob: int = 70,
+        rsi_os: int = 30,
     ) -> pd.Series:
         """TREND相場でのRSI過熱・売られすぎエントリーを禁止。"""
         signal = signal.copy()
         if "RSI" not in df.columns:
             return signal
         trend_mask = market_state.str.startswith("TREND")
-        signal[(trend_mask) & (df["RSI"] > 70) & (signal == -1)] = 0
-        signal[(trend_mask) & (df["RSI"] < 30) & (signal == 1)] = 0
+        signal[(trend_mask) & (df["RSI"] > rsi_ob) & (signal == -1)] = 0
+        signal[(trend_mask) & (df["RSI"] < rsi_os) & (signal == 1)] = 0
         return signal
 
     @staticmethod
@@ -180,8 +190,15 @@ class StrategyEngine:
 class SignalGenerator:
     """全処理を統合して最終シグナルを生成する。"""
 
-    def __init__(self, score_threshold: int = _DEFAULT_THRESHOLD):
+    def __init__(
+        self,
+        score_threshold: int = _DEFAULT_THRESHOLD,
+        rsi_ob: int = 70,
+        rsi_os: int = 30,
+    ):
         self.score_threshold = score_threshold
+        self.rsi_ob = rsi_ob
+        self.rsi_os = rsi_os
         self._analyzer = MarketAnalyzer()
         self._evaluator = IndicatorEvaluator()
         self._engine = StrategyEngine()
@@ -197,7 +214,7 @@ class SignalGenerator:
         score = (
             self._evaluator.evaluate_MA(df)
             + self._evaluator.evaluate_MACD(df)
-            + self._evaluator.evaluate_RSI(df, market_state)
+            + self._evaluator.evaluate_RSI(df, market_state, self.rsi_ob, self.rsi_os)
             + self._evaluator.evaluate_BB(df, market_state)
         )
         df["context_score"] = score
@@ -217,7 +234,7 @@ class SignalGenerator:
         raw[bullish_div & (raw == -1)] = 0
 
         # 5. 禁止ルール適用
-        raw = self._engine.apply_forbidden_rules(raw, df, market_state)
+        raw = self._engine.apply_forbidden_rules(raw, df, market_state, self.rsi_ob, self.rsi_os)
 
         # 6. フィルター適用
         final = self._engine.apply_filters(raw, df)
@@ -235,9 +252,15 @@ def generate_context_signal(
     active: list[str],
     extra_sig_cols: list[str] | None = None,
     score_threshold: int = _DEFAULT_THRESHOLD,
+    rsi_ob: int = 70,
+    rsi_os: int = 30,
 ) -> pd.DataFrame:
     """
     app.py の merge_all_signals / generate_composite_signal と互換の公開関数。
     active / extra_sig_cols は将来の拡張用（現バージョンでは参照しない）。
     """
-    return SignalGenerator(score_threshold=score_threshold).generate(df)
+    return SignalGenerator(
+        score_threshold=score_threshold,
+        rsi_ob=rsi_ob,
+        rsi_os=rsi_os,
+    ).generate(df)

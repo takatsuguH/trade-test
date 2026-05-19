@@ -21,6 +21,7 @@ from src.analysis.correlation import analyze_correlations, INDICATOR_META
 from src.indicators.signal_generator import generate_ext_signals, build_ext_composite
 from src.optimization.searcher import find_best_combination
 from src.optimization.timeframe_detector import analyze_timeframe
+from src.optimization.rsi_detector import analyze_rsi
 from src.db import storage as db
 from src.data.edinet import check_api_connection, find_latest_filing, DOC_TYPE_LABELS
 from src.indicators.fundamental import (
@@ -559,19 +560,50 @@ def _get_company_name(ticker: str) -> str:
     return st.session_state[cache_key]
 
 
-def _auto_save_setting(ticker: str, setting_key: str) -> None:
-    """トグル変更時に単一設定をDBへ自動保存するコールバック。"""
+def _save_all_settings(ticker: str) -> None:
+    """全設定をDBへ即時保存するコールバック（あらゆる設定変更時に呼ぶ）。"""
     pfx = f"cfg_{ticker}"
-    new_val = st.session_state.get(f"{pfx}_{setting_key}", db.DEFAULT_SETTINGS.get(setting_key))
-    saved = {**db.DEFAULT_SETTINGS, **db.load_settings(ticker)}
-    saved[setting_key] = new_val
-    db.save_settings(ticker, saved)
+    if f"{pfx}_use_ma" not in st.session_state:
+        return  # ウィジェット未描画時はスキップ
+    _s = {
+        _k: st.session_state.get(f"{pfx}_{_k}", db.DEFAULT_SETTINGS[_k])
+        for _k in db.DEFAULT_SETTINGS if _k != "extra_checked"
+    }
+    _s["extra_checked"] = [
+        _cn
+        for _, _grp in _SIDEBAR_EXTRA_GROUPS
+        for _, _cn in _grp
+        if st.session_state.get(f"{pfx}_ext_{_cn}", False)
+    ]
+    db.save_settings(ticker, _s)
+
+
+def _auto_save_setting(ticker: str, setting_key: str) -> None:
+    """後方互換のため残す。全設定を保存する。"""
+    _save_all_settings(ticker)
+
+
+def _turn_off_timeframe_diag(ticker: str) -> None:
+    """MA値手動変更時に時間軸診断トグルをOFFにし、全設定をDBへ保存する。"""
+    pfx = f"cfg_{ticker}"
+    st.session_state[f"{pfx}_show_timeframe_diagnosis"] = False
+    _save_all_settings(ticker)
+
+
+def _turn_off_rsi_diag(ticker: str) -> None:
+    """RSI値手動変更時にRSI診断トグルをOFFにし、全設定をDBへ保存する。"""
+    pfx = f"cfg_{ticker}"
+    st.session_state[f"{pfx}_show_rsi_diagnosis"] = False
+    _save_all_settings(ticker)
 
 
 def _get_ticker_settings(ticker: str) -> dict:
     """セッション状態（ライブ値）または DB から銘柄の設定を取得する。"""
     pfx = f"cfg_{ticker}"
-    if st.session_state.get(f"_cfg_init_{ticker}"):
+    # ウィジェットキーが session_state に実際に存在する場合のみライブ値を使用。
+    # 別銘柄表示中にウィジェットが未描画になると Streamlit がキーを削除するため、
+    # その状態で session_state を読むとデフォルト値が返り計算がずれる。
+    if st.session_state.get(f"_cfg_init_{ticker}") and f"{pfx}_use_ma" in st.session_state:
         s: dict = {}
         for k, v in db.DEFAULT_SETTINGS.items():
             if k != "extra_checked":
@@ -585,6 +617,25 @@ def _get_ticker_settings(ticker: str) -> dict:
         return s
     loaded = db.load_settings(ticker)
     return {**db.DEFAULT_SETTINGS, **loaded}
+
+
+def _get_effective_settings(ticker: str, period: str) -> dict:
+    """診断トグルON時に診断推奨値で上書きした有効設定を返す。"""
+    _s = _get_ticker_settings(ticker)
+    if _s.get("show_timeframe_diagnosis", False):
+        _tf_cache = db.load_diagnosis_cache(ticker, "timeframe", period)
+        if _tf_cache:
+            _b = _tf_cache.get("best_combined", {})
+            if _b.get("short") and _b.get("long"):
+                _s = {**_s, "ma_short": _b["short"], "ma_long": _b["long"]}
+    if _s.get("show_rsi_diagnosis", False):
+        _rsi_cache = db.load_diagnosis_cache(ticker, "rsi", period)
+        if _rsi_cache:
+            _b = _rsi_cache.get("best_combined", {})
+            if _b.get("ob") and _b.get("os"):
+                _s = {**_s, "rsi_ob": _b["ob"], "rsi_os": _b["os"],
+                      "rsi_diag_ob": _b["ob"], "rsi_diag_os": _b["os"]}
+    return _s
 
 
 def _build_indicator_config(s: dict) -> dict:
@@ -652,7 +703,7 @@ def _prepare_ticker_df_and_backtest(
     ticker: str, period: str
 ) -> tuple[pd.DataFrame | None, dict | None, dict]:
     """データ取得・指標計算・バックテスト。失敗時は (None, None, {})。"""
-    _s = _get_ticker_settings(ticker)
+    _s = _get_effective_settings(ticker, period)
     ic = _build_indicator_config(_s)
     active = _build_active_indicators(_s)
     ext_params = _build_ext_params(_s)
@@ -687,13 +738,17 @@ def _prepare_ticker_df_and_backtest(
         df, _ext_sig_cols = generate_ext_signals(df, extra_cols, params=_s)
         if _s.get("use_context_strategy", False):
             df = generate_context_signal(df, active, _ext_sig_cols,
-                                         score_threshold=_s.get("context_score_threshold", 5))
+                                         score_threshold=_s.get("context_score_threshold", 5),
+                                         rsi_ob=_s.get("rsi_diag_ob", 70),
+                                         rsi_os=_s.get("rsi_diag_os", 30))
         else:
             df = merge_all_signals(df, active, _ext_sig_cols)
     else:
         if _s.get("use_context_strategy", False):
             df = generate_context_signal(df, active,
-                                         score_threshold=_s.get("context_score_threshold", 5))
+                                         score_threshold=_s.get("context_score_threshold", 5),
+                                         rsi_ob=_s.get("rsi_diag_ob", 70),
+                                         rsi_os=_s.get("rsi_diag_os", 30))
         else:
             df = generate_composite_signal(df, active)
 
@@ -756,12 +811,47 @@ def _refresh_portfolio_summaries(tickers: list[str], period: str) -> None:
             }
 
 
+def _invalidate_stale_summaries(period: str) -> None:
+    """設定変更を検知してbt_summary_・df_ext_キャッシュをサイドバー表示前に無効化する。"""
+    for item in st.session_state.get("ticker_items", []):
+        t = item.get("code", "")
+        if not t:
+            continue
+        _s = _get_effective_settings(t, period)
+        _active = _build_active_indicators(_s)
+        _ic = _build_indicator_config(_s)
+        _ext_p = _build_ext_params(_s)
+        _hash = (
+            f"period={period}"
+            f"|{','.join(sorted(_active))}"
+            f"|ic={_json.dumps(_ic, sort_keys=True)}"
+            f"|ctx={_s.get('use_context_strategy', False)}"
+            f"|thr={_s.get('context_score_threshold', 5)}"
+            f"|rsi_diag={_s.get('rsi_diag_ob', 70)}/{_s.get('rsi_diag_os', 30)}"
+            f"|fund={_s.get('fund_integrate', False)}"
+            f"|risk={_s.get('stop_loss', 5)}/{_s.get('take_profit', 10)}"
+            f"/{_s.get('max_pos', 100)}/{_s.get('rebuy_dip', 0)}"
+            f"|cash={_s.get('initial_cash', 1_000_000)}"
+            f"|ext={_json.dumps(_ext_p, sort_keys=True)}"
+        )
+        _hash_key = f"_sig_hash_{t}"
+        if st.session_state.get(_hash_key) != _hash:
+            st.session_state.pop(f"bt_summary_{t}", None)
+            for _k in [k for k in list(st.session_state.keys())
+                       if k.startswith(f"df_ext_{t}_")]:
+                st.session_state.pop(_k, None)
+            st.session_state[_hash_key] = _hash
+
+
 _ensure_ticker_items()
 
 # DBから取得期間を先読みしてsession_stateにセット
 # （サイドバー描画前にbt_summary_を正しい期間で計算するために必要）
 if "_period" not in st.session_state:
     st.session_state["_period"] = db.load_global_settings().get("period", "1y")
+
+# 設定変更を検知してbt_summary_を無効化（サイドバー事前計算の前に実行）
+_invalidate_stale_summaries(st.session_state.get("_period", "1y"))
 
 # サイドバーの「ポートフォリオサマリー」が1レンダリング遅れないよう、
 # bt_summary_ が未作成の銘柄だけ事前に計算しておく
@@ -923,11 +1013,21 @@ with st.sidebar:
                 st.session_state[_init_key] = True
 
             # ── メイン4指標 ──
-            _use_ma = st.checkbox("移動平均（MA）", key=f"{pfx}_use_ma")
+            _use_ma = st.checkbox("移動平均（MA）", key=f"{pfx}_use_ma",
+                                  on_change=_save_all_settings, args=(settings_ticker,))
             if _use_ma:
+                _tf_on = st.session_state.get(f"{pfx}_show_timeframe_diagnosis", True)
+                if _tf_on:
+                    _tf_c = db.load_diagnosis_cache(
+                        settings_ticker, "timeframe", st.session_state.get("_period", "1y"))
+                    if _tf_c and "best_combined" in _tf_c:
+                        _b = _tf_c["best_combined"]
+                        st.caption(f"診断値適用中: 短期={_b['short']} / 長期={_b['long']}（{_b['label']}）")
                 _c1, _c2 = st.columns(2)
-                _c1.number_input("短期", min_value=2,  max_value=50,  step=1, key=f"{pfx}_ma_short")
-                _c2.number_input("長期", min_value=5,  max_value=200, step=1, key=f"{pfx}_ma_long")
+                _c1.number_input("短期", min_value=2,  max_value=50,  step=1, key=f"{pfx}_ma_short",
+                                 on_change=_turn_off_timeframe_diag, args=(settings_ticker,))
+                _c2.number_input("長期", min_value=5,  max_value=200, step=1, key=f"{pfx}_ma_long",
+                                 on_change=_turn_off_timeframe_diag, args=(settings_ticker,))
             st.toggle(
                 "🕐 時間軸適合診断を表示",
                 key=f"{pfx}_show_timeframe_diagnosis",
@@ -936,32 +1036,58 @@ with st.sidebar:
                 help="ONにすると現在の銘柄の時間軸適合診断（MA設定最適化）をダッシュボードに表示します。設定は自動保存されます。",
             )
 
-            _use_rsi = st.checkbox("RSI", key=f"{pfx}_use_rsi")
+            _use_rsi = st.checkbox("RSI", key=f"{pfx}_use_rsi",
+                                   on_change=_save_all_settings, args=(settings_ticker,))
             if _use_rsi:
-                st.slider("RSI 期間", 5, 30, key=f"{pfx}_rsi_period")
+                st.slider("RSI 期間", 5, 30, key=f"{pfx}_rsi_period",
+                          on_change=_save_all_settings, args=(settings_ticker,))
+                _rsi_on = st.session_state.get(f"{pfx}_show_rsi_diagnosis", True)
+                if _rsi_on:
+                    _rsi_c = db.load_diagnosis_cache(
+                        settings_ticker, "rsi", st.session_state.get("_period", "1y"))
+                    if _rsi_c and "best_combined" in _rsi_c:
+                        _b = _rsi_c["best_combined"]
+                        st.caption(f"診断値適用中: 買われすぎ={_b['ob']} / 売られすぎ={_b['os']}（{_b['label']}）")
                 _c1, _c2 = st.columns(2)
-                _c1.number_input("買われすぎ", min_value=60, max_value=90, step=1, key=f"{pfx}_rsi_ob")
-                _c2.number_input("売られすぎ", min_value=10, max_value=40, step=1, key=f"{pfx}_rsi_os")
+                _c1.number_input("買われすぎ", min_value=60, max_value=90, step=1, key=f"{pfx}_rsi_ob",
+                                 on_change=_turn_off_rsi_diag, args=(settings_ticker,))
+                _c2.number_input("売られすぎ", min_value=10, max_value=40, step=1, key=f"{pfx}_rsi_os",
+                                 on_change=_turn_off_rsi_diag, args=(settings_ticker,))
+            st.toggle(
+                "📊 RSI閾値適合診断を表示",
+                key=f"{pfx}_show_rsi_diagnosis",
+                on_change=_auto_save_setting,
+                args=(settings_ticker, "show_rsi_diagnosis"),
+                help="ONにすると現在の銘柄のRSI閾値適合診断（早期/遅延反転型）をダッシュボードに表示します。設定は自動保存されます。",
+            )
 
-            _use_macd = st.checkbox("MACD", key=f"{pfx}_use_macd")
+            _use_macd = st.checkbox("MACD", key=f"{pfx}_use_macd",
+                                    on_change=_save_all_settings, args=(settings_ticker,))
             if _use_macd:
                 _c1, _c2, _c3 = st.columns(3)
-                _c1.number_input("Fast",   min_value=3,  max_value=50,  step=1, key=f"{pfx}_macd_fast")
-                _c2.number_input("Slow",   min_value=5,  max_value=100, step=1, key=f"{pfx}_macd_slow")
-                _c3.number_input("Signal", min_value=2,  max_value=30,  step=1, key=f"{pfx}_macd_sig")
+                _c1.number_input("Fast",   min_value=3,  max_value=50,  step=1, key=f"{pfx}_macd_fast",
+                                 on_change=_save_all_settings, args=(settings_ticker,))
+                _c2.number_input("Slow",   min_value=5,  max_value=100, step=1, key=f"{pfx}_macd_slow",
+                                 on_change=_save_all_settings, args=(settings_ticker,))
+                _c3.number_input("Signal", min_value=2,  max_value=30,  step=1, key=f"{pfx}_macd_sig",
+                                 on_change=_save_all_settings, args=(settings_ticker,))
 
-            _use_bb = st.checkbox("ボリンジャーバンド", key=f"{pfx}_use_bb")
+            _use_bb = st.checkbox("ボリンジャーバンド", key=f"{pfx}_use_bb",
+                                  on_change=_save_all_settings, args=(settings_ticker,))
             if _use_bb:
                 _c1, _c2 = st.columns(2)
-                _c1.number_input("BB期間",  min_value=5,   max_value=50,  step=1,   key=f"{pfx}_bb_period")
+                _c1.number_input("BB期間",  min_value=5,   max_value=50,  step=1,   key=f"{pfx}_bb_period",
+                                 on_change=_save_all_settings, args=(settings_ticker,))
                 _c2.number_input("標準偏差", min_value=1.0, max_value=3.0, step=0.5,
-                                 format="%.1f", key=f"{pfx}_bb_std")
+                                 format="%.1f", key=f"{pfx}_bb_std",
+                                 on_change=_save_all_settings, args=(settings_ticker,))
 
             # ── シグナル方式切り替え ──
             st.divider()
             _use_ctx = st.toggle(
                 "🧠 コンテキスト方式（TREND/RANGE判定）",
                 key=f"{pfx}_use_context_strategy",
+                on_change=_save_all_settings, args=(settings_ticker,),
                 help="ONにすると相場状態を先に判定し、重み付きスコアで売買判断します。OFFは従来の多数決方式。",
             )
             if _use_ctx:
@@ -969,6 +1095,7 @@ with st.sidebar:
                     "スコア閾値（エントリーに必要な最低スコア）",
                     min_value=3, max_value=10, step=1,
                     key=f"{pfx}_context_score_threshold",
+                    on_change=_save_all_settings, args=(settings_ticker,),
                     help="スコアの最大値は10（MA±3、MACD±3、RSI±2、BB±2）",
                 )
 
@@ -983,6 +1110,7 @@ with st.sidebar:
                         _is_checked = st.checkbox(
                             _label,
                             key=f"{pfx}_ext_{_col_name}",
+                            on_change=_save_all_settings, args=(settings_ticker,),
                             help=_meta.get("desc", ""),
                         )
                         if _is_checked:
@@ -997,12 +1125,14 @@ with st.sidebar:
                                             _plbl,
                                             min_value=float(_pmn), max_value=float(_pmx),
                                             step=float(_pstep), format="%.2f", key=_wk,
+                                            on_change=_save_all_settings, args=(settings_ticker,),
                                         )
                                     else:
                                         _pcols[_pi].number_input(
                                             _plbl,
                                             min_value=int(_pmn), max_value=int(_pmx),
                                             step=int(_pstep), key=_wk,
+                                            on_change=_save_all_settings, args=(settings_ticker,),
                                         )
 
             # ── 投資・リスク設定 ──
@@ -1011,19 +1141,25 @@ with st.sidebar:
             st.number_input(
                 "初期資金（円）", min_value=100_000, step=100_000,
                 key=f"{pfx}_initial_cash",
+                on_change=_save_all_settings, args=(settings_ticker,),
             )
             st.number_input(
                 "最大株数（株）", min_value=0, step=100,
                 key=f"{pfx}_max_shares",
+                on_change=_save_all_settings, args=(settings_ticker,),
                 help="0=制限なし（初期資金の投資割合で自動決定）",
             )
             _rc1, _rc2 = st.columns(2)
-            _rc1.slider("損切りライン（%）", 1, 30, key=f"{pfx}_stop_loss")
-            _rc2.slider("利確ライン（%）",   1, 50, key=f"{pfx}_take_profit")
+            _rc1.slider("損切りライン（%）", 1, 30, key=f"{pfx}_stop_loss",
+                        on_change=_save_all_settings, args=(settings_ticker,))
+            _rc2.slider("利確ライン（%）",   1, 50, key=f"{pfx}_take_profit",
+                        on_change=_save_all_settings, args=(settings_ticker,))
             _rc1, _rc2 = st.columns(2)
-            _rc1.slider("最大投資割合（%）",   10, 100, key=f"{pfx}_max_pos")
+            _rc1.slider("最大投資割合（%）",   10, 100, key=f"{pfx}_max_pos",
+                        on_change=_save_all_settings, args=(settings_ticker,))
             _rc2.slider(
                 "買い戻し下落率（%）", 0, 20, key=f"{pfx}_rebuy_dip",
+                on_change=_save_all_settings, args=(settings_ticker,),
                 help="0=シグナルが出次第即時再エントリー",
             )
 
@@ -1545,8 +1681,8 @@ for ticker in tickers:
     if ticker != st.session_state.get("active_ticker"):
         continue
     with st.container():
-        # 銘柄別設定を取得
-        _s = _get_ticker_settings(ticker)
+        # 銘柄別設定を取得（診断トグルON時は推奨値で上書き）
+        _s = _get_effective_settings(ticker, period)
         ic = _build_indicator_config(_s)
         active = _build_active_indicators(_s)
         ext_params = _build_ext_params(_s)
@@ -1555,21 +1691,6 @@ for ticker in tickers:
                           if INDICATOR_META.get(c, {}).get("type") == "overlay"]
         extra_oscillators = [c for c in extra_cols
                              if INDICATOR_META.get(c, {}).get("type") != "overlay"]
-
-        # シグナル設定が変わったら bt_summary_ と df_ext_ を無効化
-        _sig_hash = (
-            f"{','.join(sorted(active))}"
-            f"|ctx={_s.get('use_context_strategy', False)}"
-            f"|thr={_s.get('context_score_threshold', 5)}"
-            f"|ext={_json.dumps(ext_params, sort_keys=True)}"
-        )
-        _sig_hash_key = f"_sig_hash_{ticker}"
-        if st.session_state.get(_sig_hash_key) != _sig_hash:
-            st.session_state.pop(f"bt_summary_{ticker}", None)
-            for _k in [k for k in list(st.session_state.keys())
-                       if k.startswith(f"df_ext_{ticker}_")]:
-                st.session_state.pop(_k, None)
-            st.session_state[_sig_hash_key] = _sig_hash
 
         with st.spinner(f"{ticker} のデータを取得中..."):
             try:
@@ -1597,13 +1718,17 @@ for ticker in tickers:
             df, _ext_sig_cols = generate_ext_signals(df, extra_cols, params=_s)
             if _s.get("use_context_strategy", False):
                 df = generate_context_signal(df, active, _ext_sig_cols,
-                                             score_threshold=_s.get("context_score_threshold", 5))
+                                             score_threshold=_s.get("context_score_threshold", 5),
+                                             rsi_ob=_s.get("rsi_diag_ob", 70),
+                                             rsi_os=_s.get("rsi_diag_os", 30))
             else:
                 df = merge_all_signals(df, active, _ext_sig_cols)
         else:
             if _s.get("use_context_strategy", False):
                 df = generate_context_signal(df, active,
-                                             score_threshold=_s.get("context_score_threshold", 5))
+                                             score_threshold=_s.get("context_score_threshold", 5),
+                                             rsi_ob=_s.get("rsi_diag_ob", 70),
+                                             rsi_os=_s.get("rsi_diag_os", 30))
             else:
                 df = generate_composite_signal(df, active)
 
@@ -1994,7 +2119,27 @@ for ticker in tickers:
                 "4種類のMA設定（超短期〜長期）でバックテストを比較し、"
                 "この銘柄に適した時間軸とレジームを診断します。"
             )
-            if st.button("▶ 診断実行", key=f"run_tf_{ticker}"):
+            # キャッシュ自動ロード（当日更新済みならDBから即表示）
+            if st.session_state.get(_tf_key) is None:
+                _cached_tf = db.load_diagnosis_cache(ticker, "timeframe", period)
+                if _cached_tf is not None:
+                    st.session_state[_tf_key] = _cached_tf
+                else:
+                    _tf_df = st.session_state.get(f"df_{ticker}", None)
+                    if _tf_df is None:
+                        try:
+                            _tf_df = get_stock_data(ticker, period=period)
+                        except Exception as _e:
+                            st.error(f"データ取得エラー: {_e}")
+                            _tf_df = None
+                    if _tf_df is not None:
+                        with st.spinner("各MA設定でバックテスト実行中..."):
+                            _tf_ic = _s.get("initial_cash", 1_000_000)
+                            _tf_result = analyze_timeframe(_tf_df, initial_cash=_tf_ic)
+                            db.save_diagnosis_cache(ticker, "timeframe", period, _tf_result)
+                            st.session_state[_tf_key] = _tf_result
+
+            if st.button("🔄 再診断", key=f"run_tf_{ticker}", help="最新データで再診断してDBに保存します"):
                 _tf_df = st.session_state.get(f"df_{ticker}", None)
                 if _tf_df is None:
                     try:
@@ -2005,10 +2150,14 @@ for ticker in tickers:
                 if _tf_df is not None:
                     with st.spinner("各MA設定でバックテスト実行中..."):
                         _tf_ic = _s.get("initial_cash", 1_000_000)
-                        st.session_state[_tf_key] = analyze_timeframe(_tf_df, initial_cash=_tf_ic)
+                        _tf_result = analyze_timeframe(_tf_df, initial_cash=_tf_ic)
+                        db.save_diagnosis_cache(ticker, "timeframe", period, _tf_result)
+                        st.session_state[_tf_key] = _tf_result
 
             tf_res = st.session_state.get(_tf_key)
             if tf_res:
+                if tf_res.get("_cached_at"):
+                    st.caption(f"キャッシュ使用（本日 {tf_res['_cached_at']} 更新）")
                 if "error" in tf_res:
                     st.error(tf_res["error"])
                 else:
@@ -2108,6 +2257,145 @@ for ticker in tickers:
                     st.caption(
                         "⚠️ この診断は過去データに基づく参考値です。"
                         " 相場の状態は変化するため、定期的に再診断してください。"
+                    )
+
+        # ─── RSI閾値適合診断（アクティブ銘柄のみ）───
+        if _s.get("show_rsi_diagnosis", False):
+            st.divider()
+            _rsi_key = f"rsi_result_{ticker}_{period}"
+            _rsi_cname = _get_company_name(ticker)
+            _rsi_cname_str = f"  {_rsi_cname}" if _rsi_cname != ticker else ""
+            st.subheader(f"📊 RSI閾値適合診断: {ticker}{_rsi_cname_str}")
+            st.caption(
+                "4種類のRSI閾値設定でバックテストを比較し、"
+                "この銘柄が早期反転型か遅延反転型かを診断します。"
+            )
+            # キャッシュ自動ロード（当日更新済みならDBから即表示）
+            if st.session_state.get(_rsi_key) is None:
+                _cached_rsi = db.load_diagnosis_cache(ticker, "rsi", period)
+                if _cached_rsi is not None:
+                    st.session_state[_rsi_key] = _cached_rsi
+                else:
+                    _rsi_df = st.session_state.get(f"df_{ticker}", None)
+                    if _rsi_df is None:
+                        try:
+                            _rsi_df = get_stock_data(ticker, period=period)
+                        except Exception as _e:
+                            st.error(f"データ取得エラー: {_e}")
+                            _rsi_df = None
+                    if _rsi_df is not None:
+                        with st.spinner("各RSI閾値でバックテスト実行中..."):
+                            _rsi_ic = _s.get("initial_cash", 1_000_000)
+                            _rsi_result = analyze_rsi(_rsi_df, initial_cash=_rsi_ic)
+                            db.save_diagnosis_cache(ticker, "rsi", period, _rsi_result)
+                            st.session_state[_rsi_key] = _rsi_result
+
+            if st.button("🔄 再診断", key=f"run_rsi_{ticker}", help="最新データで再診断してDBに保存します"):
+                _rsi_df = st.session_state.get(f"df_{ticker}", None)
+                if _rsi_df is None:
+                    try:
+                        _rsi_df = get_stock_data(ticker, period=period)
+                    except Exception as _e:
+                        st.error(f"データ取得エラー: {_e}")
+                        _rsi_df = None
+                if _rsi_df is not None:
+                    with st.spinner("各RSI閾値でバックテスト実行中..."):
+                        _rsi_ic = _s.get("initial_cash", 1_000_000)
+                        _rsi_result = analyze_rsi(_rsi_df, initial_cash=_rsi_ic)
+                        db.save_diagnosis_cache(ticker, "rsi", period, _rsi_result)
+                        st.session_state[_rsi_key] = _rsi_result
+
+            rsi_res = st.session_state.get(_rsi_key)
+            if rsi_res:
+                if rsi_res.get("_cached_at"):
+                    st.caption(f"キャッシュ使用（本日 {rsi_res['_cached_at']} 更新）")
+                if "error" in rsi_res:
+                    st.error(rsi_res["error"])
+                else:
+                    reversal = rsi_res["reversal"]
+                    best = rsi_res["best_combined"]
+                    rlabel = rsi_res["reversal_label"]
+                    dom = reversal["dominant"]
+                    badge = "⚡" if dom == "EARLY_REVERSAL" else ("🐢" if dom == "LATE_REVERSAL" else "↔️")
+
+                    _rc1, _rc2, _rc3 = st.columns([1, 2, 1])
+                    _rc1.metric("銘柄タイプ", f"{badge} {rlabel}")
+                    _rc2.metric(
+                        "推奨RSI設定",
+                        best["label"],
+                        f"リターン {best['return_pct']:+.2f}% / PF {best['profit_factor']:.2f}",
+                    )
+                    if _rc3.button(
+                        "⭐ この設定を適用",
+                        key=f"apply_rsi_{ticker}",
+                        type="primary",
+                        help=f"買われすぎ={best['ob']} / 売られすぎ={best['os']} をコンテキスト方式に適用してDBに保存します",
+                    ):
+                        _pfx = f"cfg_{ticker}"
+                        _apply_s = {
+                            _k: st.session_state.get(f"{_pfx}_{_k}", db.DEFAULT_SETTINGS[_k])
+                            for _k in db.DEFAULT_SETTINGS if _k != "extra_checked"
+                        }
+                        _apply_s["rsi_diag_ob"] = best["ob"]
+                        _apply_s["rsi_diag_os"] = best["os"]
+                        _apply_s["extra_checked"] = [
+                            _cn
+                            for _, _grp in _SIDEBAR_EXTRA_GROUPS
+                            for _, _cn in _grp
+                            if st.session_state.get(f"{_pfx}_ext_{_cn}", False)
+                        ]
+                        db.save_settings(ticker, _apply_s)
+                        st.session_state.pop(f"_cfg_init_{ticker}", None)
+                        for _ck in [k for k in list(st.session_state.keys())
+                                    if ticker in k and any(k.startswith(p) for p in
+                                       ("df_", "bt_summary_", "opt_", "corr_cache_", "df_ext_"))]:
+                            st.session_state.pop(_ck, None)
+                        st.success(
+                            f"RSI設定を適用しました（買われすぎ={best['ob']} / 売られすぎ={best['os']}）"
+                            "  コンテキスト方式ONの場合に有効です。"
+                        )
+                        st.rerun()
+
+                    # ── RSI設定別バックテスト比較表 ──
+                    def _color_rsi_val(val):
+                        if isinstance(val, float):
+                            return f"color: {'#00cc66' if val > 0 else '#ff4444'}"
+                        return ""
+
+                    st.markdown("**RSI閾値別バックテスト比較**")
+                    _rsi_rows = []
+                    for c in rsi_res["configs"]:
+                        is_best = c["label"] == best["label"]
+                        _rsi_rows.append({
+                            "RSI設定":    ("★ " if is_best else "") + c["label"],
+                            "リターン(%)": c["return_pct"],
+                            "勝率(%)":    c["win_rate_pct"],
+                            "取引回数":   c["trade_count"],
+                            "PF":         c["profit_factor"],
+                            "最大DD(%)":  c["max_dd_pct"],
+                        })
+                    _rsi_df2 = pd.DataFrame(_rsi_rows)
+                    st.dataframe(
+                        _rsi_df2.style.map(_color_rsi_val, subset=["リターン(%)", "最大DD(%)"]),
+                        hide_index=True,
+                        use_container_width=True,
+                    )
+
+                    # ── 反応速度スコア詳細 ──
+                    st.markdown("**反応速度スコア詳細**")
+                    _rev_rows = []
+                    for k, v in reversal["details"].items():
+                        _rev_rows.append({
+                            "指標":  {"zone_ratio": "60/40ゾーン比率", "continuation": "70/30への進展率",
+                                      "touch_frequency": "タッチ頻度"}.get(k, k),
+                            "値":    v["value"],
+                            "詳細":  v["desc"],
+                        })
+                    st.dataframe(pd.DataFrame(_rev_rows), hide_index=True, use_container_width=True)
+
+                    st.caption(
+                        "⚠️ この診断は過去データに基づく参考値です。"
+                        " 適用後はコンテキスト方式をONにすると選択した閾値が使用されます。"
                     )
 
         st.divider()
