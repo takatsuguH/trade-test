@@ -4,5 +4,17 @@
     "PYTHONUTF8": "1",
     "PYTHONIOENCODING": "utf-8"
   },
-  "terminal.integrated.shellIntegration.enabled": true
+  "terminal.integrated.shellIntegration.enabled": true,
+  "terminal.integrated.defaultProfile.windows": "PowerShell UTF-8",
+  "terminal.integrated.profiles.windows": {
+    "PowerShell UTF-8": {
+      "source": "PowerShell",
+      "args": [
+        "-NoExit",
+        "-Command",
+        "chcp 65001 | Out-Null; $OutputEncoding = [Console]::OutputEncoding = [System.Text.Encoding]::UTF8"
+      ],
+      "icon": "terminal-powershell"
+    }
+  }
 }

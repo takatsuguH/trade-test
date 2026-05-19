@@ -10,15 +10,17 @@ import pandas as pd
 import yfinance as yf
 from streamlit_autorefresh import st_autorefresh
 
-from src.data.fetcher import get_stock_data
+from src.data.fetcher import get_stock_data as _get_stock_data_raw
 from src.indicators.calculator import calculate_all
 from src.indicators.extended import calculate_extended, calculate_short_signals
 from src.strategies.composite import generate_composite_signal, merge_all_signals
+from src.strategies.context_strategy import generate_context_signal
 from src.risk.manager import RiskManager
 from src.backtest import run_backtest
 from src.analysis.correlation import analyze_correlations, INDICATOR_META
 from src.indicators.signal_generator import generate_ext_signals, build_ext_composite
 from src.optimization.searcher import find_best_combination
+from src.optimization.timeframe_detector import analyze_timeframe
 from src.db import storage as db
 from src.data.edinet import check_api_connection, find_latest_filing, DOC_TYPE_LABELS
 from src.indicators.fundamental import (
@@ -41,6 +43,13 @@ st.set_page_config(
 )
 
 db.init_db()
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def get_stock_data(ticker: str, period: str, interval: str = "1d") -> pd.DataFrame:
+    """株価データ取得（5分キャッシュ）。同一セッション内で一貫したデータを返す。"""
+    return _get_stock_data_raw(ticker, period, interval)
+
 
 # ─────────────────────────────────────────────
 # ダークテーマ カスタムCSS
@@ -536,6 +545,20 @@ _COL_PARAMS: dict[str, list[tuple]] = {
 # ─────────────────────────────────────────────
 # ヘルパー：銘柄別設定の取得・構築
 # ─────────────────────────────────────────────
+def _get_company_name(ticker: str) -> str:
+    """企業名を取得してセッションにキャッシュする（取得失敗時はtickerをそのまま返す）。"""
+    cache_key = f"_company_name_{ticker}"
+    if cache_key not in st.session_state:
+        try:
+            import yfinance as yf
+            info = yf.Ticker(ticker).info
+            name = info.get("shortName") or info.get("longName") or ticker
+        except Exception:
+            name = ticker
+        st.session_state[cache_key] = name
+    return st.session_state[cache_key]
+
+
 def _get_ticker_settings(ticker: str) -> dict:
     """セッション状態（ライブ値）または DB から銘柄の設定を取得する。"""
     pfx = f"cfg_{ticker}"
@@ -648,14 +671,22 @@ def _prepare_ticker_df_and_backtest(
         if st.session_state.get(_ext_sig_key) != _ext_sig or ext_df_key not in st.session_state:
             st.session_state[ext_df_key] = calculate_extended(df, ext_params)
             st.session_state[_ext_sig_key] = _ext_sig
-        df_ext = st.session_state[ext_df_key]
+        df_ext = st.session_state[ext_df_key].copy()  # コピーで mutation を防止
         for _col in df_ext.columns:
             if _col not in df.columns:
                 df[_col] = df_ext[_col]
         df, _ext_sig_cols = generate_ext_signals(df, extra_cols, params=_s)
-        df = merge_all_signals(df, active, _ext_sig_cols)
+        if _s.get("use_context_strategy", False):
+            df = generate_context_signal(df, active, _ext_sig_cols,
+                                         score_threshold=_s.get("context_score_threshold", 5))
+        else:
+            df = merge_all_signals(df, active, _ext_sig_cols)
     else:
-        df = generate_composite_signal(df, active)
+        if _s.get("use_context_strategy", False):
+            df = generate_context_signal(df, active,
+                                         score_threshold=_s.get("context_score_threshold", 5))
+        else:
+            df = generate_composite_signal(df, active)
 
     _fund_settings = _get_fund_settings(ticker)
     _fund_data = get_fundamental_data_cached(ticker)
@@ -665,12 +696,16 @@ def _prepare_ticker_df_and_backtest(
     _fund_integrate = st.session_state.get(f"fund_integrate_{ticker}", False)
 
     if _fund_integrate and _fund_count > 0 and "vote_sum" in df.columns:
-        _tech_col_count = len(active) + len(extra_cols)
-        _tech_threshold = max(1, _tech_col_count / 2)
+        _use_ctx = _s.get("use_context_strategy", False)
+        if _use_ctx:
+            _threshold = _s.get("context_score_threshold", 5)
+        else:
+            _tech_col_count = len(active) + len(extra_cols)
+            _threshold = max(1, _tech_col_count / 2)
         df["vote_sum"] = df["vote_sum"] + _fund_score
         df["composite_signal"] = 0
-        df.loc[df["vote_sum"] >= _tech_threshold, "composite_signal"] = 1
-        df.loc[df["vote_sum"] <= -_tech_threshold, "composite_signal"] = -1
+        df.loc[df["vote_sum"] >= _threshold, "composite_signal"] = 1
+        df.loc[df["vote_sum"] <= -_threshold, "composite_signal"] = -1
         df["order"] = df["composite_signal"].diff()
 
     initial_cash = int(_s.get("initial_cash", 1_000_000))
@@ -711,6 +746,17 @@ def _refresh_portfolio_summaries(tickers: list[str], period: str) -> None:
 
 
 _ensure_ticker_items()
+
+# サイドバーの「ポートフォリオサマリー」が1レンダリング遅れないよう、
+# bt_summary_ が未作成の銘柄だけ事前に計算しておく
+_sb_pre = [
+    item["code"]
+    for item in st.session_state.get("ticker_items", [])
+    if item["code"] and f"bt_summary_{item['code']}" not in st.session_state
+]
+if _sb_pre:
+    _refresh_portfolio_summaries(_sb_pre, st.session_state.get("_period", "1y"))
+
 # ─────────────────────────────────────────────
 # サイドバー設定
 # ─────────────────────────────────────────────
@@ -888,6 +934,21 @@ with st.sidebar:
                 _c2.number_input("標準偏差", min_value=1.0, max_value=3.0, step=0.5,
                                  format="%.1f", key=f"{pfx}_bb_std")
 
+            # ── シグナル方式切り替え ──
+            st.divider()
+            _use_ctx = st.toggle(
+                "🧠 コンテキスト方式（TREND/RANGE判定）",
+                key=f"{pfx}_use_context_strategy",
+                help="ONにすると相場状態を先に判定し、重み付きスコアで売買判断します。OFFは従来の多数決方式。",
+            )
+            if _use_ctx:
+                st.slider(
+                    "スコア閾値（エントリーに必要な最低スコア）",
+                    min_value=3, max_value=10, step=1,
+                    key=f"{pfx}_context_score_threshold",
+                    help="スコアの最大値は10（MA±3、MACD±3、RSI±2、BB±2）",
+                )
+
             # ── 追加指標（27種）＋ パラメータ設定 ──
             st.divider()
             with st.expander("📊 追加テクニカル指標（27種）"):
@@ -1045,50 +1106,6 @@ with st.sidebar:
             format_func=lambda x: f"{x}秒",
         )
 
-    # ── ポートフォリオサマリー（全登録銘柄を合算）──
-    st.divider()
-    if tickers:
-        with st.spinner("ポートフォリオを集計中..."):
-            _refresh_portfolio_summaries(tickers, period)
-    _sb_tickers = list(tickers)
-    _all_initial = sum(
-        st.session_state[f"bt_summary_{t}"]["initial_cash"]
-        for t in _sb_tickers if f"bt_summary_{t}" in st.session_state
-    )
-    _all_final = sum(
-        st.session_state[f"bt_summary_{t}"]["final_value"]
-        for t in _sb_tickers if f"bt_summary_{t}" in st.session_state
-    )
-    _cached_n = sum(1 for t in _sb_tickers if f"bt_summary_{t}" in st.session_state)
-    _total_n = len(_sb_tickers)
-
-    if _cached_n > 0 and _all_initial > 0:
-        _total_profit = _all_final - _all_initial
-        _total_ret_pct = _total_profit / _all_initial * 100
-        _pcolor = "#00ff88" if _total_profit >= 0 else "#ff4060"
-        _sign = "+" if _total_profit >= 0 else ""
-        _n_label = f"{_cached_n}銘柄" if _cached_n == _total_n else f"{_cached_n}/{_total_n}銘柄"
-        st.markdown(
-            f"""<motion style='background:#111827;border:1px solid #1e2d40;border-radius:8px;
-                padding:10px 12px;margin-bottom:8px'>
-              <div style='font-size:0.68rem;color:#8892a4;margin-bottom:4px'>
-                ポートフォリオ合計（{_n_label}）</motion>
-              <div style='font-size:0.75rem;color:#8892a4'>
-                初期投資合計: <span style='color:#e8eaf0'>{_all_initial:,.0f}円</span></div>
-              <div style='font-size:0.75rem;color:#8892a4'>
-                損益合計: <span style='color:{_pcolor};font-weight:600'>
-                  {_sign}{_total_profit:,.0f}円</span></motion>
-              <div style='font-size:0.85rem;color:{_pcolor};font-weight:700;margin-top:2px'>
-                合計リターン: {_total_ret_pct:+.2f}%</div>
-            </motion>""",
-            unsafe_allow_html=True,
-        )
-        if _cached_n < _total_n:
-            st.caption("一部銘柄のデータ取得に失敗したため、集計から除外されています")
-    elif _total_n > 0:
-        st.caption("銘柄データを取得できませんでした")
-    else:
-        st.caption("銘柄を登録するとリターンが集計されます")
 
 # 自動更新（ページ全体を再実行）
 if auto_refresh:
@@ -1438,6 +1455,21 @@ for ticker in tickers:
         extra_oscillators = [c for c in extra_cols
                              if INDICATOR_META.get(c, {}).get("type") != "overlay"]
 
+        # シグナル設定が変わったら bt_summary_ と df_ext_ を無効化
+        _sig_hash = (
+            f"{','.join(sorted(active))}"
+            f"|ctx={_s.get('use_context_strategy', False)}"
+            f"|thr={_s.get('context_score_threshold', 5)}"
+            f"|ext={_json.dumps(ext_params, sort_keys=True)}"
+        )
+        _sig_hash_key = f"_sig_hash_{ticker}"
+        if st.session_state.get(_sig_hash_key) != _sig_hash:
+            st.session_state.pop(f"bt_summary_{ticker}", None)
+            for _k in [k for k in list(st.session_state.keys())
+                       if k.startswith(f"df_ext_{ticker}_")]:
+                st.session_state.pop(_k, None)
+            st.session_state[_sig_hash_key] = _sig_hash
+
         with st.spinner(f"{ticker} のデータを取得中..."):
             try:
                 df = get_stock_data(ticker, period=period)
@@ -1457,14 +1489,22 @@ for ticker in tickers:
             if st.session_state.get(_ext_sig_key) != _ext_sig or ext_df_key not in st.session_state:
                 st.session_state[ext_df_key] = calculate_extended(df, ext_params)
                 st.session_state[_ext_sig_key] = _ext_sig
-            df_ext = st.session_state[ext_df_key]
+            df_ext = st.session_state[ext_df_key].copy()  # コピーで mutation を防止
             for _col in df_ext.columns:
                 if _col not in df.columns:
                     df[_col] = df_ext[_col]
             df, _ext_sig_cols = generate_ext_signals(df, extra_cols, params=_s)
-            df = merge_all_signals(df, active, _ext_sig_cols)
+            if _s.get("use_context_strategy", False):
+                df = generate_context_signal(df, active, _ext_sig_cols,
+                                             score_threshold=_s.get("context_score_threshold", 5))
+            else:
+                df = merge_all_signals(df, active, _ext_sig_cols)
         else:
-            df = generate_composite_signal(df, active)
+            if _s.get("use_context_strategy", False):
+                df = generate_context_signal(df, active,
+                                             score_threshold=_s.get("context_score_threshold", 5))
+            else:
+                df = generate_composite_signal(df, active)
 
         # ── ファンダメンタルデータ取得（バックテスト前に実施）──
         _is_jp_stock = ticker.upper().endswith(".T")
@@ -1479,12 +1519,16 @@ for ticker in tickers:
         # ── ファンダメンタル統合 ──
         # テクニカルの閾値は据え置き、fund_score を vote_sum への定数加算として扱う
         if _fund_integrate and _fund_count > 0 and "vote_sum" in df.columns:
-            _tech_col_count = len(active) + len(extra_cols)
-            _tech_threshold = max(1, _tech_col_count / 2)
+            _use_ctx = _s.get("use_context_strategy", False)
+            if _use_ctx:
+                _threshold = _s.get("context_score_threshold", 5)
+            else:
+                _tech_col_count = len(active) + len(extra_cols)
+                _threshold = max(1, _tech_col_count / 2)
             df["vote_sum"] = df["vote_sum"] + _fund_score
             df["composite_signal"] = 0
-            df.loc[df["vote_sum"] >= _tech_threshold, "composite_signal"] = 1
-            df.loc[df["vote_sum"] <= -_tech_threshold, "composite_signal"] = -1
+            df.loc[df["vote_sum"] >= _threshold, "composite_signal"] = 1
+            df.loc[df["vote_sum"] <= -_threshold, "composite_signal"] = -1
             df["order"] = df["composite_signal"].diff()
 
         # バックテスト実行（銘柄別リスク・投資設定を使用）
@@ -1995,6 +2039,139 @@ for ticker in tickers:
                     td["profit"] = td["profit"].apply(lambda x: f"{x:+,.0f}円" if pd.notna(x) else "-")
                     td.columns   = ["日付", "種別", "株価", "株数", "損益"]
                     st.dataframe(td, width="stretch", hide_index=True)
+
+# ─────────────────────────────────────────────
+# 時間軸適合診断
+# ─────────────────────────────────────────────
+st.divider()
+for ticker in tickers:
+    _tf_key = f"tf_result_{ticker}_{period}"
+    _tf_cname = _get_company_name(ticker)
+    _tf_title = f"🕐 時間軸適合診断: {ticker}" + (f"  {_tf_cname}" if _tf_cname != ticker else "")
+    with st.expander(_tf_title, expanded=False):
+        st.caption(
+            "4種類のMA設定（超短期〜長期）でバックテストを比較し、"
+            "この銘柄に適した時間軸とレジームを診断します。"
+        )
+        if st.button("▶ 診断実行", key=f"run_tf_{ticker}"):
+            _tf_df = st.session_state.get(f"df_{ticker}", None)
+            if _tf_df is None:
+                try:
+                    _tf_df = get_stock_data(ticker, period=period)
+                except Exception as _e:
+                    st.error(f"データ取得エラー: {_e}")
+                    _tf_df = None
+            if _tf_df is not None:
+                with st.spinner("各MA設定でバックテスト実行中..."):
+                    _tf_s = _get_ticker_settings(ticker)
+                    _tf_ic = _tf_s.get("initial_cash", 1_000_000)
+                    st.session_state[_tf_key] = analyze_timeframe(_tf_df, initial_cash=_tf_ic)
+
+        tf_res = st.session_state.get(_tf_key)
+        if tf_res:
+            if "error" in tf_res:
+                st.error(tf_res["error"])
+            else:
+                # ── 総合判定 ──
+                regime = tf_res["regime"]
+                best = tf_res["best_combined"]
+                rlabel = tf_res["regime_label"]
+                dom = regime["dominant"]
+                badge = "📈" if dom == "SHORT_TERM" else ("📉" if dom == "LONG_TERM" else "↔️")
+
+                _rc1, _rc2, _rc3 = st.columns([1, 2, 1])
+                _rc1.metric("レジーム判定", f"{badge} {rlabel}")
+                _rc2.metric(
+                    "推奨MA設定",
+                    best["label"],
+                    f"リターン {best['return_pct']:+.2f}% / PF {best['profit_factor']:.2f}",
+                )
+                if _rc3.button(
+                    "⭐ この設定を適用",
+                    key=f"apply_tf_{ticker}",
+                    type="primary",
+                    help=f"短期MA={best['short']} / 長期MA={best['long']} をこの銘柄に適用してDBに保存します",
+                ):
+                    _pfx = f"cfg_{ticker}"
+                    # 現在のセッション状態（extra_checkedを除く全設定）を取得してMAだけ上書き
+                    _apply_s = {
+                        _k: st.session_state.get(f"{_pfx}_{_k}", db.DEFAULT_SETTINGS[_k])
+                        for _k in db.DEFAULT_SETTINGS if _k != "extra_checked"
+                    }
+                    _apply_s["ma_short"] = best["short"]
+                    _apply_s["ma_long"]  = best["long"]
+                    _apply_s["use_ma"]   = True
+                    _apply_s["extra_checked"] = [
+                        _cn
+                        for _, _grp in _SIDEBAR_EXTRA_GROUPS
+                        for _, _cn in _grp
+                        if st.session_state.get(f"{_pfx}_ext_{_cn}", False)
+                    ]
+                    db.save_settings(ticker, _apply_s)
+                    # サイドバー初期化キーを削除 → 次回レンダリングでDBから再読み込みさせる
+                    st.session_state.pop(f"_cfg_init_{ticker}", None)
+                    # シグナル・バックテストキャッシュを無効化
+                    for _ck in [k for k in list(st.session_state.keys())
+                                if ticker in k and any(k.startswith(p) for p in
+                                   ("df_", "bt_summary_", "opt_", "corr_cache_", "df_ext_"))]:
+                        st.session_state.pop(_ck, None)
+                    st.success(f"MA設定を適用しました（短期={best['short']} / 長期={best['long']}）")
+                    st.rerun()
+
+                # ── MA設定別バックテスト比較表 ──
+                st.markdown("**MA設定別バックテスト比較**")
+                _cfg_rows = []
+                for c in tf_res["configs"]:
+                    is_best = c["label"] == best["label"]
+                    _cfg_rows.append({
+                        "MA設定":     ("★ " if is_best else "") + c["label"],
+                        "リターン(%)": c["return_pct"],
+                        "勝率(%)":    c["win_rate_pct"],
+                        "取引回数":   c["trade_count"],
+                        "PF":         c["profit_factor"],
+                        "最大DD(%)":  c["max_dd_pct"],
+                    })
+                _cfg_df = pd.DataFrame(_cfg_rows)
+
+                def _color_return(val):
+                    if isinstance(val, float):
+                        return f"color: {'#00cc66' if val > 0 else '#ff4444'}"
+                    return ""
+
+                st.dataframe(
+                    _cfg_df.style.map(_color_return, subset=["リターン(%)", "最大DD(%)"]),
+                    hide_index=True,
+                    width="stretch",
+                )
+
+                # ── レジームスコア詳細 ──
+                st.markdown("**レジームスコア詳細**")
+                _score_rows = []
+                _label_map = {
+                    "ma_cross":      "MAクロス頻度",
+                    "bb_width":      "BB幅変動",
+                    "rsi_behavior":  "RSI挙動",
+                    "macd_behavior": "MACDゼロライン",
+                }
+                for k, v in regime["details"].items():
+                    _score_rows.append({
+                        "指標":       _label_map.get(k, k),
+                        "短期スコア": v["short"],
+                        "長期スコア": v["long"],
+                        "詳細":       v["desc"],
+                    })
+                _score_rows.append({
+                    "指標": "合計",
+                    "短期スコア": regime["short_score"],
+                    "長期スコア": regime["long_score"],
+                    "詳細": f"最大{regime['max_score']}点",
+                })
+                st.dataframe(pd.DataFrame(_score_rows), hide_index=True, width="stretch")
+
+                st.caption(
+                    "⚠️ この診断は過去データに基づく参考値です。"
+                    " 相場の状態は変化するため、定期的に再診断してください。"
+                )
 
 # ─────────────────────────────────────────────
 # フッター

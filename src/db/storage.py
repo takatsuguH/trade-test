@@ -81,6 +81,9 @@ DEFAULT_SETTINGS: dict = {
     # 投資設定（銘柄別）
     "initial_cash": 1_000_000,
     "max_shares": 0,
+    # シグナル方式
+    "use_context_strategy": False,
+    "context_score_threshold": 5,
 }
 
 
