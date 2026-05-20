@@ -686,7 +686,7 @@ def _apply_diag_and_clear_caches(ticker: str, updates: dict) -> None:
 
 
 def _on_toggle_timeframe_diag(ticker: str) -> None:
-    """時間軸診断トグル切替コールバック: ON→常に再診断して自動適用、無効なら確認フラグをセット。"""
+    """時間軸診断トグル切替コールバック: ON→キャッシュがあれば即時適用、なければ描画後適用フラグをセット。"""
     pfx = f"cfg_{ticker}"
     is_on = bool(st.session_state.get(f"{pfx}_show_timeframe_diagnosis", False))
     if is_on:
@@ -695,10 +695,20 @@ def _on_toggle_timeframe_diag(ticker: str) -> None:
             st.session_state.get(f"{pfx}_ma_short", db.DEFAULT_SETTINGS["ma_short"]))
         st.session_state[f"{pfx}_snap_tf_ma_long"] = int(
             st.session_state.get(f"{pfx}_ma_long", db.DEFAULT_SETTINGS["ma_long"]))
-        # 常に再診断: session_stateのキャッシュをクリアして再実行フラグをセット
         for _k in [k for k in list(st.session_state.keys()) if k.startswith(f"tf_result_{ticker}_")]:
             st.session_state.pop(_k, None)
-        st.session_state[f"_diag_auto_apply_{ticker}_timeframe"] = True
+        st.session_state.pop(f"_diag_inline_confirm_{ticker}_timeframe", None)
+        # キャッシュがあれば即時適用してフォームに反映、なければ描画後に診断して適用
+        _period = st.session_state.get("_period", "1y")
+        _cached = db.load_diagnosis_cache(ticker, "timeframe", _period)
+        if _cached is not None and _cached.get("best_combined", {}).get("short"):
+            _b = _cached["best_combined"]
+            _apply_diag_and_clear_caches(ticker, {
+                "ma_short": _b["short"], "ma_long": _b["long"], "use_ma": True,
+            })
+        else:
+            st.session_state[f"_diag_auto_apply_{ticker}_timeframe"] = True
+            _save_all_settings(ticker)
     else:
         # 診断OFFでスナップショットが残っていれば元の設定に復元
         snap_short = st.session_state.get(f"{pfx}_snap_tf_ma_short")
@@ -708,25 +718,32 @@ def _on_toggle_timeframe_diag(ticker: str) -> None:
             st.session_state[f"{pfx}_ma_long"]  = int(snap_long)
             st.session_state[f"{pfx}_snap_tf_ma_short"] = None
             st.session_state[f"{pfx}_snap_tf_ma_long"]  = None
-    _save_all_settings(ticker)
+        _save_all_settings(ticker)
 
 
 def _on_toggle_rsi_diag(ticker: str) -> None:
-    """RSI診断トグル切替コールバック: ON→常に再診断して自動適用、無効なら確認フラグをセット。"""
+    """RSI診断トグル切替コールバック: ON→キャッシュがあれば即時適用、なければ描画後適用フラグをセット。"""
     pfx = f"cfg_{ticker}"
     is_on = bool(st.session_state.get(f"{pfx}_show_rsi_diagnosis", False))
     if is_on:
-        # 診断適用前の rsi_ob/os をスナップショットとして保存
         st.session_state[f"{pfx}_snap_rsi_ob"] = int(
             st.session_state.get(f"{pfx}_rsi_ob", db.DEFAULT_SETTINGS["rsi_ob"]))
         st.session_state[f"{pfx}_snap_rsi_os"] = int(
             st.session_state.get(f"{pfx}_rsi_os", db.DEFAULT_SETTINGS["rsi_os"]))
-        # 常に再診断: session_stateのキャッシュをクリアして再実行フラグをセット
         for _k in [k for k in list(st.session_state.keys()) if k.startswith(f"rsi_result_{ticker}_")]:
             st.session_state.pop(_k, None)
-        st.session_state[f"_diag_auto_apply_{ticker}_rsi"] = True
+        st.session_state.pop(f"_diag_inline_confirm_{ticker}_rsi", None)
+        _period = st.session_state.get("_period", "1y")
+        _cached = db.load_diagnosis_cache(ticker, "rsi", _period)
+        if _cached is not None and _cached.get("best_combined", {}).get("ob"):
+            _b = _cached["best_combined"]
+            _apply_diag_and_clear_caches(ticker, {
+                "rsi_ob": _b["ob"], "rsi_os": _b["os"],
+            })
+        else:
+            st.session_state[f"_diag_auto_apply_{ticker}_rsi"] = True
+            _save_all_settings(ticker)
     else:
-        # 診断OFFでスナップショットが残っていれば rsi_ob/os を元に戻す
         snap_ob = st.session_state.get(f"{pfx}_snap_rsi_ob")
         snap_os = st.session_state.get(f"{pfx}_snap_rsi_os")
         if snap_ob is not None and snap_os is not None:
@@ -734,27 +751,34 @@ def _on_toggle_rsi_diag(ticker: str) -> None:
             st.session_state[f"{pfx}_rsi_os"] = int(snap_os)
             st.session_state[f"{pfx}_snap_rsi_ob"] = None
             st.session_state[f"{pfx}_snap_rsi_os"] = None
-    _save_all_settings(ticker)
+        _save_all_settings(ticker)
 
 
 def _on_toggle_macd_diag(ticker: str) -> None:
-    """MACD診断トグル切替コールバック: ON→常に再診断して自動適用、無効なら確認フラグをセット。"""
+    """MACD診断トグル切替コールバック: ON→キャッシュがあれば即時適用、なければ描画後適用フラグをセット。"""
     pfx = f"cfg_{ticker}"
     is_on = bool(st.session_state.get(f"{pfx}_show_macd_diagnosis", False))
     if is_on:
-        # 診断適用前の macd_fast/slow/sig をスナップショットとして保存
         st.session_state[f"{pfx}_snap_macd_fast"] = int(
             st.session_state.get(f"{pfx}_macd_fast", db.DEFAULT_SETTINGS["macd_fast"]))
         st.session_state[f"{pfx}_snap_macd_slow"] = int(
             st.session_state.get(f"{pfx}_macd_slow", db.DEFAULT_SETTINGS["macd_slow"]))
         st.session_state[f"{pfx}_snap_macd_sig"]  = int(
             st.session_state.get(f"{pfx}_macd_sig",  db.DEFAULT_SETTINGS["macd_sig"]))
-        # 常に再診断: session_stateのキャッシュをクリアして再実行フラグをセット
         for _k in [k for k in list(st.session_state.keys()) if k.startswith(f"macd_result_{ticker}_")]:
             st.session_state.pop(_k, None)
-        st.session_state[f"_diag_auto_apply_{ticker}_macd"] = True
+        st.session_state.pop(f"_diag_inline_confirm_{ticker}_macd", None)
+        _period = st.session_state.get("_period", "1y")
+        _cached = db.load_diagnosis_cache(ticker, "macd", _period)
+        if _cached is not None and _cached.get("best_combined", {}).get("fast"):
+            _b = _cached["best_combined"]
+            _apply_diag_and_clear_caches(ticker, {
+                "macd_fast": _b["fast"], "macd_slow": _b["slow"], "macd_sig": _b["sig"],
+            })
+        else:
+            st.session_state[f"_diag_auto_apply_{ticker}_macd"] = True
+            _save_all_settings(ticker)
     else:
-        # 診断OFFでスナップショットが残っていれば macd_fast/slow/sig を元に戻す
         snap_fast = st.session_state.get(f"{pfx}_snap_macd_fast")
         snap_slow = st.session_state.get(f"{pfx}_snap_macd_slow")
         snap_sig  = st.session_state.get(f"{pfx}_snap_macd_sig")
@@ -765,7 +789,7 @@ def _on_toggle_macd_diag(ticker: str) -> None:
             st.session_state[f"{pfx}_snap_macd_fast"] = None
             st.session_state[f"{pfx}_snap_macd_slow"] = None
             st.session_state[f"{pfx}_snap_macd_sig"]  = None
-    _save_all_settings(ticker)
+        _save_all_settings(ticker)
 
 
 def _get_ticker_settings(ticker: str, db_only: bool = False) -> dict:
@@ -796,19 +820,19 @@ def _get_effective_settings(ticker: str, period: str, db_only: bool = False) -> 
     _s = _get_ticker_settings(ticker, db_only=db_only)
     if _s.get("show_timeframe_diagnosis", False):
         _tf_cache = db.load_diagnosis_cache(ticker, "timeframe", period)
-        if _tf_cache and _is_diag_effective(_tf_cache):
+        if _tf_cache:
             _b = _tf_cache.get("best_combined", {})
             if _b.get("short") and _b.get("long"):
                 _s = {**_s, "ma_short": _b["short"], "ma_long": _b["long"]}
     if _s.get("show_rsi_diagnosis", False):
         _rsi_cache = db.load_diagnosis_cache(ticker, "rsi", period)
-        if _rsi_cache and _is_diag_effective(_rsi_cache):
+        if _rsi_cache:
             _b = _rsi_cache.get("best_combined", {})
             if _b.get("ob") and _b.get("os"):
                 _s = {**_s, "rsi_ob": _b["ob"], "rsi_os": _b["os"]}
     if _s.get("show_macd_diagnosis", False):
         _macd_cache = db.load_diagnosis_cache(ticker, "macd", period)
-        if _macd_cache and _is_diag_effective(_macd_cache):
+        if _macd_cache:
             _b = _macd_cache.get("best_combined", {})
             if _b.get("fast") and _b.get("slow") and _b.get("sig"):
                 _s = {**_s, "macd_fast": _b["fast"], "macd_slow": _b["slow"], "macd_sig": _b["sig"]}
@@ -1195,34 +1219,27 @@ with st.sidebar:
                         _macd_res = analyze_macd(_new_df, initial_cash=_new_cash, indicator_config=_new_cfg)
                         db.save_diagnosis_cache(new_code, "macd", _sb_period, _macd_res)
 
-                        _tf_ok   = _is_diag_effective(_tf_res)
-                        _rsi_ok  = _is_diag_effective(_rsi_res)
-                        _macd_ok = _is_diag_effective(_macd_res)
-
                         _init_s = dict(_new_s)
-                        _init_s["show_timeframe_diagnosis"] = _tf_ok
-                        _init_s["show_rsi_diagnosis"]       = _rsi_ok
-                        _init_s["show_macd_diagnosis"]      = _macd_ok
 
-                        if _tf_ok:
-                            _b = _tf_res.get("best_combined", {})
-                            if _b.get("short") and _b.get("long"):
-                                _init_s["ma_short"] = _b["short"]
-                                _init_s["ma_long"]  = _b["long"]
-                                _init_s["use_ma"]   = True
+                        _b_tf = _tf_res.get("best_combined", {})
+                        if _b_tf.get("short") and _b_tf.get("long"):
+                            _init_s["show_timeframe_diagnosis"] = True
+                            _init_s["ma_short"] = _b_tf["short"]
+                            _init_s["ma_long"]  = _b_tf["long"]
+                            _init_s["use_ma"]   = True
 
-                        if _rsi_ok:
-                            _b = _rsi_res.get("best_combined", {})
-                            if _b.get("ob") and _b.get("os"):
-                                _init_s["rsi_ob"] = _b["ob"]
-                                _init_s["rsi_os"] = _b["os"]
+                        _b_rsi = _rsi_res.get("best_combined", {})
+                        if _b_rsi.get("ob") and _b_rsi.get("os"):
+                            _init_s["show_rsi_diagnosis"] = True
+                            _init_s["rsi_ob"] = _b_rsi["ob"]
+                            _init_s["rsi_os"] = _b_rsi["os"]
 
-                        if _macd_ok:
-                            _b = _macd_res.get("best_combined", {})
-                            if _b.get("fast") and _b.get("slow") and _b.get("sig"):
-                                _init_s["macd_fast"] = _b["fast"]
-                                _init_s["macd_slow"] = _b["slow"]
-                                _init_s["macd_sig"]  = _b["sig"]
+                        _b_macd = _macd_res.get("best_combined", {})
+                        if _b_macd.get("fast") and _b_macd.get("slow") and _b_macd.get("sig"):
+                            _init_s["show_macd_diagnosis"] = True
+                            _init_s["macd_fast"] = _b_macd["fast"]
+                            _init_s["macd_slow"] = _b_macd["slow"]
+                            _init_s["macd_sig"]  = _b_macd["sig"]
 
                         db.save_settings(new_code, _init_s)
                     except Exception:
@@ -2586,6 +2603,13 @@ for ticker in tickers:
                 _cached_tf = db.load_diagnosis_cache(ticker, "timeframe", period)
                 if _cached_tf is not None and _cached_tf.get("baseline_return_pct") is not None:
                     st.session_state[_tf_key] = _cached_tf
+                    if st.session_state.pop(f"_diag_auto_apply_{ticker}_timeframe", False):
+                        _ab = _cached_tf.get("best_combined", {})
+                        if _ab.get("short") and _ab.get("long"):
+                            _apply_diag_and_clear_caches(ticker, {
+                                "ma_short": _ab["short"], "ma_long": _ab["long"], "use_ma": True,
+                            })
+                            st.rerun()
                 else:
                     _tf_df = st.session_state.get(f"df_{ticker}", None)
                     if _tf_df is None:
@@ -2600,17 +2624,13 @@ for ticker in tickers:
                             _tf_result = analyze_timeframe(_tf_df, initial_cash=_tf_ic, indicator_config=_build_diag_indicator_config(_s))
                             db.save_diagnosis_cache(ticker, "timeframe", period, _tf_result)
                             st.session_state[_tf_key] = _tf_result
-                            # トグルON時・初回診断: 自動適用フラグ処理
                             if st.session_state.pop(f"_diag_auto_apply_{ticker}_timeframe", False):
-                                if _is_diag_effective(_tf_result):
-                                    _ab = _tf_result.get("best_combined", {})
-                                    if _ab.get("short") and _ab.get("long"):
-                                        _apply_diag_and_clear_caches(ticker, {
-                                            "ma_short": _ab["short"], "ma_long": _ab["long"], "use_ma": True,
-                                        })
-                                        st.rerun()
-                                else:
-                                    st.session_state[f"_diag_inline_confirm_{ticker}_timeframe"] = True
+                                _ab = _tf_result.get("best_combined", {})
+                                if _ab.get("short") and _ab.get("long"):
+                                    _apply_diag_and_clear_caches(ticker, {
+                                        "ma_short": _ab["short"], "ma_long": _ab["long"], "use_ma": True,
+                                    })
+                                    st.rerun()
 
             if st.button("🔄 再診断", key=f"run_tf_{ticker}", help="最新データで再診断してDBに保存します"):
                 _tf_df = st.session_state.get(f"df_{ticker}", None)
@@ -2748,6 +2768,13 @@ for ticker in tickers:
                         and _cached_rsi.get("baseline_return_pct") is not None
                         and _cached_rsi.get("diag_version", 1) >= 2):
                     st.session_state[_rsi_key] = _cached_rsi
+                    if st.session_state.pop(f"_diag_auto_apply_{ticker}_rsi", False):
+                        _ab = _cached_rsi.get("best_combined", {})
+                        if _ab.get("ob") and _ab.get("os"):
+                            _apply_diag_and_clear_caches(ticker, {
+                                "rsi_ob": _ab["ob"], "rsi_os": _ab["os"],
+                            })
+                            st.rerun()
                 else:
                     _rsi_df = st.session_state.get(f"df_{ticker}", None)
                     if _rsi_df is None:
@@ -2762,17 +2789,13 @@ for ticker in tickers:
                             _rsi_result = analyze_rsi(_rsi_df, initial_cash=_rsi_ic, indicator_config=_build_diag_indicator_config(_s))
                             db.save_diagnosis_cache(ticker, "rsi", period, _rsi_result)
                             st.session_state[_rsi_key] = _rsi_result
-                            # トグルON時・初回診断: 自動適用フラグ処理
                             if st.session_state.pop(f"_diag_auto_apply_{ticker}_rsi", False):
-                                if _is_diag_effective(_rsi_result):
-                                    _ab = _rsi_result.get("best_combined", {})
-                                    if _ab.get("ob") and _ab.get("os"):
-                                        _apply_diag_and_clear_caches(ticker, {
-                                            "rsi_ob": _ab["ob"], "rsi_os": _ab["os"],
-                                        })
-                                        st.rerun()
-                                else:
-                                    st.session_state[f"_diag_inline_confirm_{ticker}_rsi"] = True
+                                _ab = _rsi_result.get("best_combined", {})
+                                if _ab.get("ob") and _ab.get("os"):
+                                    _apply_diag_and_clear_caches(ticker, {
+                                        "rsi_ob": _ab["ob"], "rsi_os": _ab["os"],
+                                    })
+                                    st.rerun()
 
             if st.button("🔄 再診断", key=f"run_rsi_{ticker}", help="最新データで再診断してDBに保存します"):
                 _rsi_df = st.session_state.get(f"df_{ticker}", None)
@@ -2903,6 +2926,13 @@ for ticker in tickers:
                 _cached_macd = db.load_diagnosis_cache(ticker, "macd", period)
                 if _cached_macd is not None and _cached_macd.get("baseline_return_pct") is not None:
                     st.session_state[_macd_key] = _cached_macd
+                    if st.session_state.pop(f"_diag_auto_apply_{ticker}_macd", False):
+                        _ab = _cached_macd.get("best_combined", {})
+                        if _ab.get("fast") and _ab.get("slow") and _ab.get("sig"):
+                            _apply_diag_and_clear_caches(ticker, {
+                                "macd_fast": _ab["fast"], "macd_slow": _ab["slow"], "macd_sig": _ab["sig"],
+                            })
+                            st.rerun()
                 else:
                     _macd_df = st.session_state.get(f"df_{ticker}", None)
                     if _macd_df is None:
@@ -2918,17 +2948,13 @@ for ticker in tickers:
                             _macd_result = analyze_macd(_macd_df, initial_cash=_macd_ic, indicator_config=_macd_cfg)
                             db.save_diagnosis_cache(ticker, "macd", period, _macd_result)
                             st.session_state[_macd_key] = _macd_result
-                            # トグルON時・初回診断: 自動適用フラグ処理
                             if st.session_state.pop(f"_diag_auto_apply_{ticker}_macd", False):
-                                if _is_diag_effective(_macd_result):
-                                    _ab = _macd_result.get("best_combined", {})
-                                    if _ab.get("fast") and _ab.get("slow") and _ab.get("sig"):
-                                        _apply_diag_and_clear_caches(ticker, {
-                                            "macd_fast": _ab["fast"], "macd_slow": _ab["slow"], "macd_sig": _ab["sig"],
-                                        })
-                                        st.rerun()
-                                else:
-                                    st.session_state[f"_diag_inline_confirm_{ticker}_macd"] = True
+                                _ab = _macd_result.get("best_combined", {})
+                                if _ab.get("fast") and _ab.get("slow") and _ab.get("sig"):
+                                    _apply_diag_and_clear_caches(ticker, {
+                                        "macd_fast": _ab["fast"], "macd_slow": _ab["slow"], "macd_sig": _ab["sig"],
+                                    })
+                                    st.rerun()
 
             if st.button("🔄 再診断", key=f"run_macd_{ticker}", help="最新データで再診断してDBに保存します"):
                 _macd_df = st.session_state.get(f"df_{ticker}", None)
