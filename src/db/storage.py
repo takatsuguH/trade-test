@@ -96,6 +96,10 @@ DEFAULT_SETTINGS: dict = {
     "rsi_diag_os": 30,
     # MACDパラメータ適合診断の表示
     "show_macd_diagnosis": True,
+    # 診断適用前スナップショット（診断トグルOFFで元の値に戻す用）
+    "snap_tf_ma_short": None, "snap_tf_ma_long": None,
+    "snap_rsi_ob": None,      "snap_rsi_os": None,
+    "snap_macd_fast": None,   "snap_macd_slow": None, "snap_macd_sig": None,
 }
 
 

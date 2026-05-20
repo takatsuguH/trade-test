@@ -1,10 +1,12 @@
 """
 RSI閾値適合性診断 — 銘柄が早期反転型か遅延反転型かを診断する。
 複数のRSI閾値設定でバックテストを比較し、反応速度スコアと合わせて最適RSI閾値を提案する。
+MACDパラメータ診断と同様に、MA+RSI+MACD+BBの複合シグナルでバックテストする。
 """
 import pandas as pd
 import numpy as np
-from src.indicators.calculator import add_rsi, add_bollinger
+from src.indicators.calculator import calculate_all, add_rsi
+from src.strategies.composite import generate_composite_signal
 from src.backtest import run_backtest
 from src.risk.manager import RiskManager
 
@@ -15,6 +17,14 @@ RSI_PRESETS: list[dict] = [
     {"label": "感応 (60/35)",   "ob": 60, "os": 35},
     {"label": "超感応 (55/40)", "ob": 55, "os": 40},
 ]
+
+# indicator_config が渡されない場合のデフォルト設定
+_DEFAULT_CONFIG: dict = {
+    "use_ma":   True,  "ma_short":   5,   "ma_long":    25,
+    "use_rsi":  True,  "rsi_period": 14,  "rsi_ob":     70,  "rsi_os":  30,
+    "use_macd": True,  "macd_fast":  12,  "macd_slow":  26,  "macd_sig": 9,
+    "use_bb":   True,  "bb_period":  20,  "bb_std":     2.0,
+}
 
 
 def _profit_factor(trades_df: pd.DataFrame) -> float:
@@ -30,14 +40,31 @@ def _profit_factor(trades_df: pd.DataFrame) -> float:
     return round(wins / abs(losses), 2)
 
 
-def _run_rsi_backtest(df: pd.DataFrame, ob: int, os: int, initial_cash: float) -> dict:
-    """指定RSI閾値のみでバックテストを実行する（RSIシグナル単独評価）。"""
+def _build_active(cfg: dict) -> list[str]:
+    active = []
+    if cfg.get("use_ma"):   active.append("MA")
+    if cfg.get("use_rsi"):  active.append("RSI")
+    if cfg.get("use_macd"): active.append("MACD")
+    if cfg.get("use_bb"):   active.append("BB")
+    return active or ["RSI"]
+
+
+def _run_rsi_backtest(
+    df: pd.DataFrame,
+    ob: int,
+    os: int,
+    initial_cash: float,
+    indicator_config: dict | None = None,
+) -> dict:
+    """指定RSI閾値での複合シグナルバックテストを実行する。
+    MA/MACD/BBなど他指標はindicator_configの設定を維持し、RSI閾値のみ差し替える。
+    """
     d = df[["Open", "High", "Low", "Close", "Volume"]].copy()
-    d = add_rsi(d, 14)
-    d["composite_signal"] = 0
-    d.loc[d["RSI"] < os, "composite_signal"] = 1    # 売られすぎ → 買い
-    d.loc[d["RSI"] > ob, "composite_signal"] = -1   # 買われすぎ → 売り
-    d["order"] = d["composite_signal"].diff()
+    base_cfg = {**_DEFAULT_CONFIG, **(indicator_config or {})}
+    cfg = {**base_cfg, "use_rsi": True, "rsi_ob": ob, "rsi_os": os}
+    d = calculate_all(d, cfg)
+    active = _build_active(cfg)
+    d = generate_composite_signal(d, active)
     risk = RiskManager(stop_loss_pct=5.0, take_profit_pct=10.0, max_position_pct=100.0)
     result = run_backtest(d, initial_cash=initial_cash, risk=risk)
     pf = _profit_factor(result["trades"])
@@ -81,26 +108,28 @@ def _compute_reversal_score(df: pd.DataFrame) -> dict:
     touch_60_per_month = touch_60 / months
 
     # 判定
-    if zone_ratio >= 3.0 and continuation < 0.4:
+    if zone_ratio > 3 and continuation < 0.4:
         dominant = "EARLY_REVERSAL"
-    elif zone_ratio <= 2.0 or continuation >= 0.55:
+    elif zone_ratio < 2 or continuation > 0.6:
         dominant = "LATE_REVERSAL"
     else:
         dominant = "MIXED"
 
     return {
-        "zone_ratio":           round(zone_ratio, 2),
-        "continuation":         round(continuation, 2),
-        "touch_70_per_month":   round(touch_70_per_month, 1),
-        "touch_60_per_month":   round(touch_60_per_month, 1),
-        "dominant":             dominant,
+        "dominant": dominant,
         "details": {
-            "zone_ratio":     {"value": round(zone_ratio, 2),
-                               "desc": f"60/40ゾーン滞在率は70/30の{zone_ratio:.1f}倍"},
-            "continuation":   {"value": round(continuation, 2),
-                               "desc": f"60超え後に70到達する割合: {continuation:.0%}"},
-            "touch_frequency": {"value": round(touch_60_per_month, 1),
-                                "desc": f"60/40タッチ 月{touch_60_per_month:.1f}回 / 70/30タッチ 月{touch_70_per_month:.1f}回"},
+            "zone_ratio": {
+                "value": round(zone_ratio, 2),
+                "desc":  f"60/40ゾーン比率 {zone_ratio:.1f}（高い→早期反転型）",
+            },
+            "continuation": {
+                "value": round(continuation, 2),
+                "desc":  f"70/30への進展率 {continuation:.0%}（低い→早期反転型）",
+            },
+            "touch_frequency": {
+                "value": round(touch_70_per_month, 1),
+                "desc":  f"月平均タッチ {touch_70_per_month:.1f}回（70/30）/ {touch_60_per_month:.1f}回（60/40）",
+            },
         },
     }
 
@@ -112,6 +141,12 @@ def analyze_rsi(
 ) -> dict:
     """
     銘柄のRSI閾値適合性を診断する。
+    RSI閾値4種を、ユーザーの現在の指標設定（MA/MACD/BB）と組み合わせた
+    複合シグナルでバックテストし、最も効果的な閾値を推奨する。
+
+    Args:
+        indicator_config: 現在の銘柄の指標設定（_build_indicator_config()の結果）。
+                          rsi_ob/rsi_os には現在のアクティブ閾値（rsi_diag_ob/os）を渡すこと。
 
     Returns:
         configs            : 各プリセットのバックテスト結果リスト
@@ -119,25 +154,26 @@ def analyze_rsi(
         best_combined      : バックテスト＋反応速度スコアの総合推奨プリセット
         reversal           : 反応速度スコア詳細
         reversal_label     : 銘柄タイプ（日本語ラベル）
-        baseline_return_pct: 現在の手動RSI設定でのリターン（比較用）
+        baseline_return_pct: 現在のアクティブRSI閾値での複合BTリターン（比較用）
         baseline_label     : 現在の設定ラベル
     """
     base_df = df[["Open", "High", "Low", "Close", "Volume"]].dropna().copy()
     if len(base_df) < 30:
         return {"error": "データが不足しています（最低30日必要）"}
 
-    # ベースライン: 現在の手動RSI設定でBT（有効性比較用）
-    _ic = indicator_config or {}
-    _cur_ob = int(_ic.get("rsi_ob", 70))
-    _cur_os = int(_ic.get("rsi_os", 30))
-    _baseline = _run_rsi_backtest(base_df, _cur_ob, _cur_os, initial_cash)
+    base_cfg = {**_DEFAULT_CONFIG, **(indicator_config or {})}
+
+    # ベースライン: 現在のアクティブRSI閾値（rsi_ob/os）で複合BT（有効性比較用）
+    _cur_ob = int(base_cfg.get("rsi_ob", 70))
+    _cur_os = int(base_cfg.get("rsi_os", 30))
+    _baseline = _run_rsi_backtest(base_df, _cur_ob, _cur_os, initial_cash, base_cfg)
     baseline_return_pct = _baseline["return_pct"]
     baseline_label = f"現在の設定 ({_cur_ob}/{_cur_os})"
 
-    # 各プリセットでバックテスト
+    # 各プリセットで複合バックテスト（RSI閾値のみ差し替え）
     configs = []
     for preset in RSI_PRESETS:
-        bt = _run_rsi_backtest(base_df, preset["ob"], preset["os"], initial_cash)
+        bt = _run_rsi_backtest(base_df, preset["ob"], preset["os"], initial_cash, base_cfg)
         configs.append({**preset, **bt})
 
     # バックテスト最優秀（リターン基準、最低3トレード以上）
@@ -175,4 +211,5 @@ def analyze_rsi(
         "reversal_label":      reversal_label,
         "baseline_return_pct": baseline_return_pct,
         "baseline_label":      baseline_label,
+        "diag_version":        2,   # 複合シグナルベース（v1: RSI単独）
     }
