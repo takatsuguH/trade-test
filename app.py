@@ -716,22 +716,22 @@ def _on_toggle_rsi_diag(ticker: str) -> None:
     pfx = f"cfg_{ticker}"
     is_on = bool(st.session_state.get(f"{pfx}_show_rsi_diagnosis", False))
     if is_on:
-        # 診断適用前の rsi_diag_ob/os をスナップショットとして保存
+        # 診断適用前の rsi_ob/os をスナップショットとして保存
         st.session_state[f"{pfx}_snap_rsi_ob"] = int(
-            st.session_state.get(f"{pfx}_rsi_diag_ob", db.DEFAULT_SETTINGS["rsi_diag_ob"]))
+            st.session_state.get(f"{pfx}_rsi_ob", db.DEFAULT_SETTINGS["rsi_ob"]))
         st.session_state[f"{pfx}_snap_rsi_os"] = int(
-            st.session_state.get(f"{pfx}_rsi_diag_os", db.DEFAULT_SETTINGS["rsi_diag_os"]))
+            st.session_state.get(f"{pfx}_rsi_os", db.DEFAULT_SETTINGS["rsi_os"]))
         # 常に再診断: session_stateのキャッシュをクリアして再実行フラグをセット
         for _k in [k for k in list(st.session_state.keys()) if k.startswith(f"rsi_result_{ticker}_")]:
             st.session_state.pop(_k, None)
         st.session_state[f"_diag_auto_apply_{ticker}_rsi"] = True
     else:
-        # 診断OFFでスナップショットが残っていれば rsi_diag_ob/os を元に戻す
+        # 診断OFFでスナップショットが残っていれば rsi_ob/os を元に戻す
         snap_ob = st.session_state.get(f"{pfx}_snap_rsi_ob")
         snap_os = st.session_state.get(f"{pfx}_snap_rsi_os")
         if snap_ob is not None and snap_os is not None:
-            st.session_state[f"{pfx}_rsi_diag_ob"] = int(snap_ob)
-            st.session_state[f"{pfx}_rsi_diag_os"] = int(snap_os)
+            st.session_state[f"{pfx}_rsi_ob"] = int(snap_ob)
+            st.session_state[f"{pfx}_rsi_os"] = int(snap_os)
             st.session_state[f"{pfx}_snap_rsi_ob"] = None
             st.session_state[f"{pfx}_snap_rsi_os"] = None
     _save_all_settings(ticker)
@@ -805,8 +805,7 @@ def _get_effective_settings(ticker: str, period: str, db_only: bool = False) -> 
         if _rsi_cache and _is_diag_effective(_rsi_cache):
             _b = _rsi_cache.get("best_combined", {})
             if _b.get("ob") and _b.get("os"):
-                _s = {**_s, "rsi_ob": _b["ob"], "rsi_os": _b["os"],
-                      "rsi_diag_ob": _b["ob"], "rsi_diag_os": _b["os"]}
+                _s = {**_s, "rsi_ob": _b["ob"], "rsi_os": _b["os"]}
     if _s.get("show_macd_diagnosis", False):
         _macd_cache = db.load_diagnosis_cache(ticker, "macd", period)
         if _macd_cache and _is_diag_effective(_macd_cache):
@@ -835,6 +834,10 @@ def _build_diag_indicator_config(s: dict) -> dict:
     if s.get("snap_tf_ma_short") is not None:
         cfg["ma_short"] = int(s["snap_tf_ma_short"])
         cfg["ma_long"]  = int(s["snap_tf_ma_long"])
+    # RSI: スナップショットがあれば診断前の手動値を使用
+    if s.get("snap_rsi_ob") is not None:
+        cfg["rsi_ob"] = int(s["snap_rsi_ob"])
+        cfg["rsi_os"] = int(s["snap_rsi_os"])
     # MACD: スナップショットがあれば診断前の手動値を使用
     if s.get("snap_macd_fast") is not None:
         cfg["macd_fast"] = int(s["snap_macd_fast"])
@@ -937,16 +940,16 @@ def _prepare_ticker_df_and_backtest(
         if _s.get("use_context_strategy", False):
             df = generate_context_signal(df, active, _ext_sig_cols,
                                          score_threshold=_s.get("context_score_threshold", 5),
-                                         rsi_ob=_s.get("rsi_diag_ob", 70),
-                                         rsi_os=_s.get("rsi_diag_os", 30))
+                                         rsi_ob=_s.get("rsi_ob", 70),
+                                         rsi_os=_s.get("rsi_os", 30))
         else:
             df = merge_all_signals(df, active, _ext_sig_cols)
     else:
         if _s.get("use_context_strategy", False):
             df = generate_context_signal(df, active,
                                          score_threshold=_s.get("context_score_threshold", 5),
-                                         rsi_ob=_s.get("rsi_diag_ob", 70),
-                                         rsi_os=_s.get("rsi_diag_os", 30))
+                                         rsi_ob=_s.get("rsi_ob", 70),
+                                         rsi_os=_s.get("rsi_os", 30))
         else:
             df = generate_composite_signal(df, active)
 
@@ -1028,7 +1031,6 @@ def _invalidate_stale_summaries(period: str) -> None:
             f"|ic={_json.dumps(_ic, sort_keys=True)}"
             f"|ctx={_s.get('use_context_strategy', False)}"
             f"|thr={_s.get('context_score_threshold', 5)}"
-            f"|rsi_diag={_s.get('rsi_diag_ob', 70)}/{_s.get('rsi_diag_os', 30)}"
             f"|fund={_s.get('fund_integrate', False)}"
             f"|risk={_s.get('stop_loss', 5)}/{_s.get('take_profit', 10)}"
             f"/{_s.get('max_pos', 100)}/{_s.get('rebuy_dip', 0)}"
@@ -1212,8 +1214,8 @@ with st.sidebar:
                         if _rsi_ok:
                             _b = _rsi_res.get("best_combined", {})
                             if _b.get("ob") and _b.get("os"):
-                                _init_s["rsi_diag_ob"] = _b["ob"]
-                                _init_s["rsi_diag_os"] = _b["os"]
+                                _init_s["rsi_ob"] = _b["ob"]
+                                _init_s["rsi_os"] = _b["os"]
 
                         if _macd_ok:
                             _b = _macd_res.get("best_combined", {})
@@ -1313,16 +1315,12 @@ with st.sidebar:
                                   on_change=_save_all_settings, args=(settings_ticker,))
             if _use_ma:
                 _tf_on = st.session_state.get(f"{pfx}_show_timeframe_diagnosis", True)
-                if _tf_on:
-                    _tf_c = db.load_diagnosis_cache(
-                        settings_ticker, "timeframe", st.session_state.get("_period", "1y"))
-                    if _tf_c and "best_combined" in _tf_c:
-                        _b = _tf_c["best_combined"]
-                        st.caption(f"診断値適用中: 短期={_b['short']} / 長期={_b['long']}（{_b['label']}）")
+                _ma_label_short = ":red[短期]" if _tf_on else "短期"
+                _ma_label_long  = ":red[長期]" if _tf_on else "長期"
                 _c1, _c2 = st.columns(2)
-                _c1.number_input("短期", min_value=2,  max_value=50,  step=1, key=f"{pfx}_ma_short",
+                _c1.number_input(_ma_label_short, min_value=2,  max_value=50,  step=1, key=f"{pfx}_ma_short",
                                  on_change=_turn_off_timeframe_diag, args=(settings_ticker,))
-                _c2.number_input("長期", min_value=5,  max_value=200, step=1, key=f"{pfx}_ma_long",
+                _c2.number_input(_ma_label_long,  min_value=5,  max_value=200, step=1, key=f"{pfx}_ma_long",
                                  on_change=_turn_off_timeframe_diag, args=(settings_ticker,))
             st.toggle(
                 "🕐 時間軸適合診断を表示",
@@ -1360,16 +1358,12 @@ with st.sidebar:
                 st.slider("RSI 期間", 5, 30, key=f"{pfx}_rsi_period",
                           on_change=_save_all_settings, args=(settings_ticker,))
                 _rsi_on = st.session_state.get(f"{pfx}_show_rsi_diagnosis", True)
-                if _rsi_on:
-                    _rsi_c = db.load_diagnosis_cache(
-                        settings_ticker, "rsi", st.session_state.get("_period", "1y"))
-                    if _rsi_c and "best_combined" in _rsi_c:
-                        _b = _rsi_c["best_combined"]
-                        st.caption(f"診断値適用中: 買われすぎ={_b['ob']} / 売られすぎ={_b['os']}（{_b['label']}）")
+                _rsi_label_ob = ":red[買われすぎ]" if _rsi_on else "買われすぎ"
+                _rsi_label_os = ":red[売られすぎ]" if _rsi_on else "売られすぎ"
                 _c1, _c2 = st.columns(2)
-                _c1.number_input("買われすぎ", min_value=60, max_value=90, step=1, key=f"{pfx}_rsi_ob",
+                _c1.number_input(_rsi_label_ob, min_value=60, max_value=90, step=1, key=f"{pfx}_rsi_ob",
                                  on_change=_turn_off_rsi_diag, args=(settings_ticker,))
-                _c2.number_input("売られすぎ", min_value=10, max_value=40, step=1, key=f"{pfx}_rsi_os",
+                _c2.number_input(_rsi_label_os, min_value=10, max_value=40, step=1, key=f"{pfx}_rsi_os",
                                  on_change=_turn_off_rsi_diag, args=(settings_ticker,))
             st.toggle(
                 "📊 RSI閾値適合診断を表示",
@@ -1388,8 +1382,8 @@ with st.sidebar:
                     _conf_best  = (_conf_cache or {}).get("best_combined", {})
                     _conf_upd   = {"show_rsi_diagnosis": True}
                     if _conf_best.get("ob") and _conf_best.get("os"):
-                        _conf_upd["rsi_diag_ob"] = _conf_best["ob"]
-                        _conf_upd["rsi_diag_os"] = _conf_best["os"]
+                        _conf_upd["rsi_ob"] = _conf_best["ob"]
+                        _conf_upd["rsi_os"] = _conf_best["os"]
                     _apply_diag_and_clear_caches(settings_ticker, _conf_upd)
                     st.session_state[f"_diag_confirm_{settings_ticker}_rsi"] = False
                     st.rerun()
@@ -1404,22 +1398,15 @@ with st.sidebar:
                                     on_change=_save_all_settings, args=(settings_ticker,))
             if _use_macd:
                 _macd_on = st.session_state.get(f"{pfx}_show_macd_diagnosis", True)
-                if _macd_on:
-                    _macd_c = db.load_diagnosis_cache(
-                        settings_ticker, "macd", st.session_state.get("_period", "1y"))
-                    if _macd_c:
-                        _mb = _macd_c.get("best_combined", {})
-                        if _mb:
-                            st.caption(
-                                f"📊 MACD診断適用中: {_mb.get('label','—')} "
-                                f"(リターン {_mb.get('return_pct', 0):+.1f}%)"
-                            )
+                _macd_label_f = ":red[Fast]"   if _macd_on else "Fast"
+                _macd_label_s = ":red[Slow]"   if _macd_on else "Slow"
+                _macd_label_g = ":red[Signal]" if _macd_on else "Signal"
                 _c1, _c2, _c3 = st.columns(3)
-                _c1.number_input("Fast",   min_value=3,  max_value=50,  step=1, key=f"{pfx}_macd_fast",
+                _c1.number_input(_macd_label_f, min_value=3,  max_value=50,  step=1, key=f"{pfx}_macd_fast",
                                  on_change=_turn_off_macd_diag, args=(settings_ticker,))
-                _c2.number_input("Slow",   min_value=5,  max_value=100, step=1, key=f"{pfx}_macd_slow",
+                _c2.number_input(_macd_label_s, min_value=5,  max_value=100, step=1, key=f"{pfx}_macd_slow",
                                  on_change=_turn_off_macd_diag, args=(settings_ticker,))
-                _c3.number_input("Signal", min_value=2,  max_value=30,  step=1, key=f"{pfx}_macd_sig",
+                _c3.number_input(_macd_label_g, min_value=2,  max_value=30,  step=1, key=f"{pfx}_macd_sig",
                                  on_change=_turn_off_macd_diag, args=(settings_ticker,))
 
             st.toggle(
@@ -2192,16 +2179,16 @@ for ticker in tickers:
             if _s.get("use_context_strategy", False):
                 df = generate_context_signal(df, active, _ext_sig_cols,
                                              score_threshold=_s.get("context_score_threshold", 5),
-                                             rsi_ob=_s.get("rsi_diag_ob", 70),
-                                             rsi_os=_s.get("rsi_diag_os", 30))
+                                             rsi_ob=_s.get("rsi_ob", 70),
+                                             rsi_os=_s.get("rsi_os", 30))
             else:
                 df = merge_all_signals(df, active, _ext_sig_cols)
         else:
             if _s.get("use_context_strategy", False):
                 df = generate_context_signal(df, active,
                                              score_threshold=_s.get("context_score_threshold", 5),
-                                             rsi_ob=_s.get("rsi_diag_ob", 70),
-                                             rsi_os=_s.get("rsi_diag_os", 30))
+                                             rsi_ob=_s.get("rsi_ob", 70),
+                                             rsi_os=_s.get("rsi_os", 30))
             else:
                 df = generate_composite_signal(df, active)
 
@@ -2781,7 +2768,7 @@ for ticker in tickers:
                                     _ab = _rsi_result.get("best_combined", {})
                                     if _ab.get("ob") and _ab.get("os"):
                                         _apply_diag_and_clear_caches(ticker, {
-                                            "rsi_diag_ob": _ab["ob"], "rsi_diag_os": _ab["os"],
+                                            "rsi_ob": _ab["ob"], "rsi_os": _ab["os"],
                                         })
                                         st.rerun()
                                 else:
@@ -2811,7 +2798,7 @@ for ticker in tickers:
                     _ib = (rsi_res or {}).get("best_combined", {})
                     _iupd = {"show_rsi_diagnosis": True}
                     if _ib.get("ob") and _ib.get("os"):
-                        _iupd["rsi_diag_ob"] = _ib["ob"]; _iupd["rsi_diag_os"] = _ib["os"]
+                        _iupd["rsi_ob"] = _ib["ob"]; _iupd["rsi_os"] = _ib["os"]
                     _apply_diag_and_clear_caches(ticker, _iupd)
                     st.session_state.pop(f"_diag_inline_confirm_{ticker}_rsi", None)
                     st.rerun()
