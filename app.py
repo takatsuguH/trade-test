@@ -22,6 +22,7 @@ from src.indicators.signal_generator import generate_ext_signals, build_ext_comp
 from src.optimization.searcher import find_best_combination
 from src.optimization.timeframe_detector import analyze_timeframe
 from src.optimization.rsi_detector import analyze_rsi
+from src.optimization.macd_detector import analyze_macd
 from src.db import storage as db
 from src.data.edinet import check_api_connection, find_latest_filing, DOC_TYPE_LABELS
 from src.indicators.fundamental import (
@@ -268,6 +269,21 @@ hr {
 /* スピナー */
 .stSpinner > div {
     border-top-color: var(--accent-cyan) !important;
+}
+
+/* Plotly モードバー（ツールバー） */
+.modebar {
+    background: rgba(13, 19, 33, 0.85) !important;
+    border-radius: 4px !important;
+}
+.modebar-btn path {
+    fill: var(--text-secondary) !important;
+}
+.modebar-btn:hover path {
+    fill: var(--accent-cyan) !important;
+}
+.modebar-btn.active path {
+    fill: var(--accent-cyan) !important;
 }
 
 /* サイドバーヘッダー */
@@ -610,13 +626,131 @@ def _turn_off_rsi_diag(ticker: str) -> None:
     _save_all_settings(ticker)
 
 
-def _get_ticker_settings(ticker: str) -> dict:
-    """セッション状態（ライブ値）または DB から銘柄の設定を取得する。"""
+def _turn_off_macd_diag(ticker: str) -> None:
+    """MACDパラメータ手動変更時にMACD診断トグルをOFFにし、全設定をDBへ保存する。"""
     pfx = f"cfg_{ticker}"
-    # ウィジェットキーが session_state に実際に存在する場合のみライブ値を使用。
-    # 別銘柄表示中にウィジェットが未描画になると Streamlit がキーを削除するため、
-    # その状態で session_state を読むとデフォルト値が返り計算がずれる。
-    if st.session_state.get(f"_cfg_init_{ticker}") and f"{pfx}_use_ma" in st.session_state:
+    st.session_state[f"{pfx}_show_macd_diagnosis"] = False
+    _save_all_settings(ticker)
+
+
+def _is_diag_effective(diag_result: dict) -> bool:
+    """診断結果が有効（best_combined > 現在の手動設定）かチェック。"""
+    if "error" in diag_result:
+        return False
+    configs = diag_result.get("configs", [])
+    if not configs:
+        return False
+    best = diag_result.get("best_combined", {})
+    baseline = diag_result.get("baseline_return_pct", None)
+    if baseline is None:
+        # 古いキャッシュ（baseline未収録）: フォールバックで旧ロジック
+        return any(c.get("return_pct", 0) > 0 for c in configs)
+    return best.get("return_pct", 0) > baseline
+
+
+def _diag_confirm_message(diag_result: dict) -> str:
+    """確認UIのメッセージ文を返す（「現在の方が良い」vs「全マイナス」で出し分け）。"""
+    best_ret  = diag_result.get("best_combined", {}).get("return_pct", 0)
+    baseline  = diag_result.get("baseline_return_pct", None)
+    if baseline is not None and best_ret > 0 and best_ret < baseline:
+        return (
+            f"⚠️ 現在の設定（リターン {baseline:+.1f}%）より診断推奨値（{best_ret:+.1f}%）が"
+            "低い状態です。切り替えると悪化する可能性がありますが、有効にしますか？"
+        )
+    return "⚠️ 全プリセットでリターンがマイナスです。それでも有効にしますか？"
+
+
+def _apply_diag_and_clear_caches(ticker: str, updates: dict) -> None:
+    """診断推奨値をDBに保存し、_cfg_init_ とキャッシュをリセットする。
+    updates に show_XXX_diagnosis=True を含めることで、トグル状態も一括保存できる。
+    session_state にウィジェットがある場合はそこを base にして、ない場合はDBから読む。
+    NOTE: _save_all_settings は呼ばない（古い session_state 値で updates を上書きされるのを防ぐ）。
+    """
+    pfx = f"cfg_{ticker}"
+    if f"{pfx}_use_ma" in st.session_state:
+        base = {_k: st.session_state.get(f"{pfx}_{_k}", db.DEFAULT_SETTINGS[_k])
+                for _k in db.DEFAULT_SETTINGS if _k != "extra_checked"}
+        base["extra_checked"] = [
+            _cn for _, _grp in _SIDEBAR_EXTRA_GROUPS for _, _cn in _grp
+            if st.session_state.get(f"{pfx}_ext_{_cn}", False)
+        ]
+    else:
+        base = {**db.DEFAULT_SETTINGS, **db.load_settings(ticker)}
+    base.update(updates)
+    db.save_settings(ticker, base)
+    st.session_state.pop(f"_cfg_init_{ticker}", None)
+    for _ck in [k for k in list(st.session_state.keys())
+                if ticker in k and any(k.startswith(p) for p in
+                   ("df_", "bt_summary_", "opt_", "corr_cache_", "df_ext_"))]:
+        st.session_state.pop(_ck, None)
+
+
+def _on_toggle_timeframe_diag(ticker: str) -> None:
+    """時間軸診断トグル切替コールバック: ON→有効なら自動適用、無効なら確認フラグをセット。"""
+    pfx = f"cfg_{ticker}"
+    is_on = bool(st.session_state.get(f"{pfx}_show_timeframe_diagnosis", False))
+    if is_on:
+        cache = db.load_diagnosis_cache(ticker, "timeframe", st.session_state.get("_period", "1y"))
+        if cache is None:
+            st.session_state[f"_diag_auto_apply_{ticker}_timeframe"] = True
+        elif not _is_diag_effective(cache):
+            st.session_state[f"_diag_confirm_{ticker}_timeframe"] = True
+            st.session_state[f"{pfx}_show_timeframe_diagnosis"] = False
+        else:
+            best = cache.get("best_combined", {})
+            if best.get("short") and best.get("long"):
+                _apply_diag_and_clear_caches(ticker, {
+                    "ma_short": best["short"], "ma_long": best["long"], "use_ma": True,
+                })
+    _save_all_settings(ticker)
+
+
+def _on_toggle_rsi_diag(ticker: str) -> None:
+    """RSI診断トグル切替コールバック: ON→有効なら自動適用、無効なら確認フラグをセット。"""
+    pfx = f"cfg_{ticker}"
+    is_on = bool(st.session_state.get(f"{pfx}_show_rsi_diagnosis", False))
+    if is_on:
+        cache = db.load_diagnosis_cache(ticker, "rsi", st.session_state.get("_period", "1y"))
+        if cache is None:
+            st.session_state[f"_diag_auto_apply_{ticker}_rsi"] = True
+        elif not _is_diag_effective(cache):
+            st.session_state[f"_diag_confirm_{ticker}_rsi"] = True
+            st.session_state[f"{pfx}_show_rsi_diagnosis"] = False
+        else:
+            best = cache.get("best_combined", {})
+            if best.get("ob") and best.get("os"):
+                _apply_diag_and_clear_caches(ticker, {
+                    "rsi_diag_ob": best["ob"], "rsi_diag_os": best["os"],
+                })
+    _save_all_settings(ticker)
+
+
+def _on_toggle_macd_diag(ticker: str) -> None:
+    """MACD診断トグル切替コールバック: ON→有効なら自動適用、無効なら確認フラグをセット。"""
+    pfx = f"cfg_{ticker}"
+    is_on = bool(st.session_state.get(f"{pfx}_show_macd_diagnosis", False))
+    if is_on:
+        cache = db.load_diagnosis_cache(ticker, "macd", st.session_state.get("_period", "1y"))
+        if cache is None:
+            st.session_state[f"_diag_auto_apply_{ticker}_macd"] = True
+        elif not _is_diag_effective(cache):
+            st.session_state[f"_diag_confirm_{ticker}_macd"] = True
+            st.session_state[f"{pfx}_show_macd_diagnosis"] = False
+        else:
+            best = cache.get("best_combined", {})
+            if best.get("fast") and best.get("slow") and best.get("sig"):
+                _apply_diag_and_clear_caches(ticker, {
+                    "macd_fast": best["fast"], "macd_slow": best["slow"], "macd_sig": best["sig"],
+                })
+    _save_all_settings(ticker)
+
+
+def _get_ticker_settings(ticker: str, db_only: bool = False) -> dict:
+    """セッション状態（ライブ値）または DB から銘柄の設定を取得する。
+    db_only=True の場合は常に DB から読む（ハッシュ計算など一貫性が必要な箇所で使用）。
+    """
+    pfx = f"cfg_{ticker}"
+    if not db_only and st.session_state.get(f"_cfg_init_{ticker}") and f"{pfx}_use_ma" in st.session_state:
         s: dict = {}
         for k, v in db.DEFAULT_SETTINGS.items():
             if k != "extra_checked":
@@ -632,22 +766,30 @@ def _get_ticker_settings(ticker: str) -> dict:
     return {**db.DEFAULT_SETTINGS, **loaded}
 
 
-def _get_effective_settings(ticker: str, period: str) -> dict:
-    """診断トグルON時に診断推奨値で上書きした有効設定を返す。"""
-    _s = _get_ticker_settings(ticker)
+def _get_effective_settings(ticker: str, period: str, db_only: bool = False) -> dict:
+    """診断トグルON時に診断推奨値で上書きした有効設定を返す。
+    db_only=True の場合は session_state を参照しない（ハッシュ一貫性確保用）。
+    """
+    _s = _get_ticker_settings(ticker, db_only=db_only)
     if _s.get("show_timeframe_diagnosis", False):
         _tf_cache = db.load_diagnosis_cache(ticker, "timeframe", period)
-        if _tf_cache:
+        if _tf_cache and _is_diag_effective(_tf_cache):
             _b = _tf_cache.get("best_combined", {})
             if _b.get("short") and _b.get("long"):
                 _s = {**_s, "ma_short": _b["short"], "ma_long": _b["long"]}
     if _s.get("show_rsi_diagnosis", False):
         _rsi_cache = db.load_diagnosis_cache(ticker, "rsi", period)
-        if _rsi_cache:
+        if _rsi_cache and _is_diag_effective(_rsi_cache):
             _b = _rsi_cache.get("best_combined", {})
             if _b.get("ob") and _b.get("os"):
                 _s = {**_s, "rsi_ob": _b["ob"], "rsi_os": _b["os"],
                       "rsi_diag_ob": _b["ob"], "rsi_diag_os": _b["os"]}
+    if _s.get("show_macd_diagnosis", False):
+        _macd_cache = db.load_diagnosis_cache(ticker, "macd", period)
+        if _macd_cache and _is_diag_effective(_macd_cache):
+            _b = _macd_cache.get("best_combined", {})
+            if _b.get("fast") and _b.get("slow") and _b.get("sig"):
+                _s = {**_s, "macd_fast": _b["fast"], "macd_slow": _b["slow"], "macd_sig": _b["sig"]}
     return _s
 
 
@@ -713,10 +855,12 @@ def _ensure_ticker_items() -> None:
 
 
 def _prepare_ticker_df_and_backtest(
-    ticker: str, period: str
+    ticker: str, period: str, db_only: bool = False
 ) -> tuple[pd.DataFrame | None, dict | None, dict]:
-    """データ取得・指標計算・バックテスト。失敗時は (None, None, {})。"""
-    _s = _get_effective_settings(ticker, period)
+    """データ取得・指標計算・バックテスト。失敗時は (None, None, {})。
+    db_only=True の場合は session_state を参照しない（サイドバー事前計算用）。
+    """
+    _s = _get_effective_settings(ticker, period, db_only=db_only)
     ic = _build_indicator_config(_s)
     active = _build_active_indicators(_s)
     ext_params = _build_ext_params(_s)
@@ -812,9 +956,11 @@ def _prepare_ticker_df_and_backtest(
 
 
 def _refresh_portfolio_summaries(tickers: list[str], period: str) -> None:
-    """登録銘柄すべてのバックテスト結果をサイドバー集計用に更新する。"""
+    """登録銘柄すべてのバックテスト結果をサイドバー集計用に更新する。
+    DB から設定を読むことでハッシュ振動を防ぐ。
+    """
     for t in tickers:
-        _df, _res, _ = _prepare_ticker_df_and_backtest(t, period)
+        _df, _res, _ = _prepare_ticker_df_and_backtest(t, period, db_only=True)
         if _res is not None:
             st.session_state[f"bt_summary_{t}"] = {
                 "initial_cash": _res["initial_cash"],
@@ -830,7 +976,8 @@ def _invalidate_stale_summaries(period: str) -> None:
         t = item.get("code", "")
         if not t:
             continue
-        _s = _get_effective_settings(t, period)
+        # db_only=True で常にDBから読む → 銘柄切替によるハッシュ振動を防ぐ
+        _s = _get_effective_settings(t, period, db_only=True)
         _active = _build_active_indicators(_s)
         _ic = _build_indicator_config(_s)
         _ext_p = _build_ext_params(_s)
@@ -847,6 +994,9 @@ def _invalidate_stale_summaries(period: str) -> None:
             f"|cash={_s.get('initial_cash', 1_000_000)}"
             f"|ext={_json.dumps(_ext_p, sort_keys=True)}"
             f"|checked={','.join(sorted(_s.get('extra_checked', [])))}"
+            f"|tf_diag={_s.get('show_timeframe_diagnosis', False)}"
+            f"|rsi_diag_on={_s.get('show_rsi_diagnosis', False)}"
+            f"|macd_diag={_s.get('show_macd_diagnosis', False)}"
         )
         _hash_key = f"_sig_hash_{t}"
         if st.session_state.get(_hash_key) != _hash:
@@ -867,61 +1017,103 @@ if "_period" not in st.session_state:
 # 設定変更を検知してbt_summary_を無効化（サイドバー事前計算の前に実行）
 _invalidate_stale_summaries(st.session_state.get("_period", "1y"))
 
-# サイドバーの「ポートフォリオサマリー」が1レンダリング遅れないよう、
-# bt_summary_ が未作成の銘柄だけ事前に計算しておく
-_sb_pre = [
-    item["code"]
-    for item in st.session_state.get("ticker_items", [])
-    if item["code"] and f"bt_summary_{item['code']}" not in st.session_state
+# サイドバー一覧用：未計算銘柄のbt_summaryを事前取得
+_sb_period = st.session_state.get("_period", "1y")
+_sb_all_tickers = [
+    item["code"] for item in st.session_state.get("ticker_items", [])
+    if item.get("code")
 ]
-if _sb_pre:
-    _refresh_portfolio_summaries(_sb_pre, st.session_state.get("_period", "1y"))
+_sb_missing = [t for t in _sb_all_tickers if f"bt_summary_{t}" not in st.session_state]
+if _sb_missing:
+    _refresh_portfolio_summaries(_sb_missing, _sb_period)
+
+# MACDパラメータ診断: キャッシュ未保存の銘柄を起動時にバックグラウンドで実行
+_macd_diag_missing = [
+    t for t in _sb_all_tickers
+    if db.load_diagnosis_cache(t, "macd", _sb_period) is None
+]
+if _macd_diag_missing:
+    for _t in _macd_diag_missing:
+        try:
+            _t_df   = get_stock_data(_t, period=_sb_period)
+            _t_s    = {**db.DEFAULT_SETTINGS, **db.load_settings(_t)}
+            _t_cash = _t_s.get("initial_cash", 1_000_000)
+            _t_cfg  = _build_indicator_config(_t_s)
+            _t_result = analyze_macd(_t_df, initial_cash=_t_cash, indicator_config=_t_cfg)
+            db.save_diagnosis_cache(_t, "macd", _sb_period, _t_result)
+        except Exception:
+            pass
 
 # ─────────────────────────────────────────────
 # サイドバー設定
 # ─────────────────────────────────────────────
 with st.sidebar:
-    # ── ポートフォリオサマリー ──
-    _sb_tickers = [
-        item["code"]
-        for item in st.session_state.get("ticker_items", [])
-        if item["code"]
-    ]
-    _all_initial = sum(
-        st.session_state[f"bt_summary_{t}"]["initial_cash"]
-        for t in _sb_tickers if f"bt_summary_{t}" in st.session_state
-    )
-    _all_final = sum(
-        st.session_state[f"bt_summary_{t}"]["final_value"]
-        for t in _sb_tickers if f"bt_summary_{t}" in st.session_state
-    )
-    _cached_n = sum(1 for t in _sb_tickers if f"bt_summary_{t}" in st.session_state)
-
-    if _cached_n > 0 and _all_initial > 0:
-        _total_profit = _all_final - _all_initial
-        _total_ret_pct = _total_profit / _all_initial * 100
-        _pcolor = "#00ff88" if _total_profit >= 0 else "#ff4060"
-        _sign = "+" if _total_profit >= 0 else ""
-        st.markdown(
-            f"""<div style='background:#111827;border:1px solid #1e2d40;border-radius:8px;
-                padding:10px 12px;margin-bottom:8px'>
-              <div style='font-size:0.68rem;color:#8892a4;margin-bottom:4px'>
-                ポートフォリオ合計（{_cached_n}銘柄）</div>
-              <div style='font-size:0.75rem;color:#8892a4'>
-                初期投資合計: <span style='color:#e8eaf0'>{_all_initial:,.0f}円</span></div>
-              <div style='font-size:0.75rem;color:#8892a4'>
-                損益合計: <span style='color:{_pcolor};font-weight:600'>
-                  {_sign}{_total_profit:,.0f}円</span></div>
-              <div style='font-size:0.85rem;color:{_pcolor};font-weight:700;margin-top:2px'>
-                合計リターン: {_total_ret_pct:+.2f}%</div>
-            </div>""",
-            unsafe_allow_html=True,
-        )
-    else:
-        st.caption("銘柄を表示するとリターンが集計されます")
-
     st.toggle("📊 基本情報パネル", value=True, key="_show_right_panel")
     st.divider()
+
+    # ── ポートフォリオ一覧 ──
+    if _sb_all_tickers:
+        # 合計集計（bt_summary が取得できている銘柄のみ）
+        _sb_total_ic = 0
+        _sb_total_fv = 0
+        _sb_valid_n = 0
+        _sb_rows_html = ""
+        for _sbt in _sb_all_tickers:
+            _sbts = st.session_state.get(f"bt_summary_{_sbt}", {})
+            if _sbts:
+                _sb_ic = _sbts.get("initial_cash", 0)
+                _sb_fv = _sbts.get("final_value", 0)
+                _sb_profit = _sb_fv - _sb_ic
+                _sb_ret = _sbts.get("total_return_pct", 0.0)
+                _sb_total_ic += _sb_ic
+                _sb_total_fv += _sb_fv
+                _sb_valid_n += 1
+                _sb_color = "#4caf50" if _sb_profit >= 0 else "#f44336"
+                _sb_sign = "+" if _sb_profit >= 0 else ""
+                _sb_rows_html += (
+                    f"<div style='margin-bottom:8px;padding-bottom:8px;"
+                    f"border-bottom:1px solid #333;'>"
+                    f"<div style='font-weight:700;font-size:0.8rem;margin-bottom:2px'>{_sbt}</div>"
+                    f"<div style='font-size:0.72rem;color:#aaa;'>初期: ¥{_sb_ic:,.0f}</div>"
+                    f"<div style='font-size:0.72rem;color:{_sb_color};'>"
+                    f"損益: {_sb_sign}¥{_sb_profit:,.0f}"
+                    f"&nbsp;({_sb_sign}{_sb_ret:.2f}%)</div>"
+                    f"</div>"
+                )
+            else:
+                _sb_rows_html += (
+                    f"<div style='margin-bottom:8px;padding-bottom:8px;"
+                    f"border-bottom:1px solid #333;'>"
+                    f"<div style='font-weight:700;font-size:0.8rem;color:#888'>{_sbt}</div>"
+                    f"<div style='font-size:0.7rem;color:#666'>— 未計算</div>"
+                    f"</div>"
+                )
+
+        # 合計サマリー HTML
+        _sb_total_profit = _sb_total_fv - _sb_total_ic
+        _sb_total_ret = ((_sb_total_fv / _sb_total_ic) - 1) * 100 if _sb_total_ic > 0 else 0.0
+        _sb_sum_color = "#4caf50" if _sb_total_profit >= 0 else "#f44336"
+        _sb_sum_sign = "+" if _sb_total_profit >= 0 else ""
+        _sb_summary_html = (
+            f"<div style='background:#1e1e2e;border-radius:6px;padding:8px 10px;"
+            f"margin-bottom:10px;border:1px solid #444;'>"
+            f"<div style='font-size:0.7rem;color:#888;margin-bottom:4px;font-weight:600'>"
+            f"📋 ポートフォリオ合計（{_sb_valid_n}銘柄）</div>"
+            f"<div style='font-size:0.72rem;color:#aaa;'>初期投資合計: ¥{_sb_total_ic:,.0f}</div>"
+            f"<div style='font-size:0.8rem;font-weight:700;color:{_sb_sum_color};margin-top:3px;'>"
+            f"損益合計: {_sb_sum_sign}¥{_sb_total_profit:,.0f}</div>"
+            f"<div style='font-size:0.72rem;color:{_sb_sum_color};'>"
+            f"合計リターン: {_sb_sum_sign}{_sb_total_ret:.2f}%</div>"
+            f"</div>"
+        )
+
+        st.markdown(_sb_summary_html, unsafe_allow_html=True)
+        with st.expander("銘柄別の損益を表示", expanded=False):
+            st.markdown(
+                f"<div style='padding:4px 0'>{_sb_rows_html}</div>",
+                unsafe_allow_html=True,
+            )
+        st.divider()
 
     with st.expander("📈 銘柄設定"):
         _ensure_ticker_items()
@@ -944,6 +1136,54 @@ with st.sidebar:
                     db.remove_stock(item["code"])
                 if new_code:
                     db.add_stock(new_code)
+                    # 新規銘柄を即時3診断してキャッシュ保存・有効性に応じてトグル設定
+                    try:
+                        _new_df    = get_stock_data(new_code, period=_sb_period)
+                        _new_s     = {**db.DEFAULT_SETTINGS, **db.load_settings(new_code)}
+                        _new_cash  = _new_s.get("initial_cash", 1_000_000)
+                        _new_cfg   = _build_indicator_config(_new_s)
+
+                        _tf_res   = analyze_timeframe(_new_df, initial_cash=_new_cash, indicator_config=_new_cfg)
+                        db.save_diagnosis_cache(new_code, "timeframe", _sb_period, _tf_res)
+
+                        _rsi_res  = analyze_rsi(_new_df, initial_cash=_new_cash, indicator_config=_new_cfg)
+                        db.save_diagnosis_cache(new_code, "rsi", _sb_period, _rsi_res)
+
+                        _macd_res = analyze_macd(_new_df, initial_cash=_new_cash, indicator_config=_new_cfg)
+                        db.save_diagnosis_cache(new_code, "macd", _sb_period, _macd_res)
+
+                        _tf_ok   = _is_diag_effective(_tf_res)
+                        _rsi_ok  = _is_diag_effective(_rsi_res)
+                        _macd_ok = _is_diag_effective(_macd_res)
+
+                        _init_s = dict(_new_s)
+                        _init_s["show_timeframe_diagnosis"] = _tf_ok
+                        _init_s["show_rsi_diagnosis"]       = _rsi_ok
+                        _init_s["show_macd_diagnosis"]      = _macd_ok
+
+                        if _tf_ok:
+                            _b = _tf_res.get("best_combined", {})
+                            if _b.get("short") and _b.get("long"):
+                                _init_s["ma_short"] = _b["short"]
+                                _init_s["ma_long"]  = _b["long"]
+                                _init_s["use_ma"]   = True
+
+                        if _rsi_ok:
+                            _b = _rsi_res.get("best_combined", {})
+                            if _b.get("ob") and _b.get("os"):
+                                _init_s["rsi_diag_ob"] = _b["ob"]
+                                _init_s["rsi_diag_os"] = _b["os"]
+
+                        if _macd_ok:
+                            _b = _macd_res.get("best_combined", {})
+                            if _b.get("fast") and _b.get("slow") and _b.get("sig"):
+                                _init_s["macd_fast"] = _b["fast"]
+                                _init_s["macd_slow"] = _b["slow"]
+                                _init_s["macd_sig"]  = _b["sig"]
+
+                        db.save_settings(new_code, _init_s)
+                    except Exception:
+                        pass
                 item["code"] = new_code
 
             if item["code"]:
@@ -1013,11 +1253,12 @@ with st.sidebar:
             if _needs_init:
                 _s0 = db.load_settings(settings_ticker)
                 _s0 = {**db.DEFAULT_SETTINGS, **_s0}
+                # on_change で即時保存しているため DB は常に最新値。
+                # 常にDBから上書きすることで session_state/DB の乖離によるハッシュ振動を防ぐ。
                 for _k, _v in db.DEFAULT_SETTINGS.items():
                     if _k != "extra_checked":
                         _sk = f"{pfx}_{_k}"
-                        if _sk not in st.session_state:
-                            st.session_state[_sk] = _s0.get(_k, _v)
+                        st.session_state[_sk] = _s0.get(_k, _v)
                 _ec0 = _s0.get("extra_checked", [])
                 for _, _grp in _SIDEBAR_EXTRA_GROUPS:
                     for _, _cn in _grp:
@@ -1045,10 +1286,30 @@ with st.sidebar:
             st.toggle(
                 "🕐 時間軸適合診断を表示",
                 key=f"{pfx}_show_timeframe_diagnosis",
-                on_change=_auto_save_setting,
-                args=(settings_ticker, "show_timeframe_diagnosis"),
-                help="ONにすると現在の銘柄の時間軸適合診断（MA設定最適化）をダッシュボードに表示します。設定は自動保存されます。",
+                on_change=_on_toggle_timeframe_diag,
+                args=(settings_ticker,),
+                help="ONにすると時間軸適合診断（MA最適化）を表示・自動適用します。",
             )
+            if st.session_state.get(f"_diag_confirm_{settings_ticker}_timeframe"):
+                _tf_cm = db.load_diagnosis_cache(settings_ticker, "timeframe", st.session_state.get("_period", "1y"))
+                st.warning(_diag_confirm_message(_tf_cm or {}))
+                _cc1, _cc2 = st.columns(2)
+                if _cc1.button("はい", key=f"confirm_tf_{settings_ticker}"):
+                    _period_now = st.session_state.get("_period", "1y")
+                    _conf_cache = db.load_diagnosis_cache(settings_ticker, "timeframe", _period_now)
+                    _conf_best  = (_conf_cache or {}).get("best_combined", {})
+                    _conf_upd   = {"show_timeframe_diagnosis": True}
+                    if _conf_best.get("short") and _conf_best.get("long"):
+                        _conf_upd["ma_short"] = _conf_best["short"]
+                        _conf_upd["ma_long"]  = _conf_best["long"]
+                        _conf_upd["use_ma"]   = True
+                    _apply_diag_and_clear_caches(settings_ticker, _conf_upd)
+                    st.session_state[f"_diag_confirm_{settings_ticker}_timeframe"] = False
+                    st.session_state[f"{pfx}_show_timeframe_diagnosis"] = True
+                    st.rerun()
+                if _cc2.button("いいえ", key=f"cancel_tf_{settings_ticker}"):
+                    st.session_state[f"_diag_confirm_{settings_ticker}_timeframe"] = False
+                    st.rerun()
 
             _use_rsi = st.checkbox("RSI", key=f"{pfx}_use_rsi",
                                    on_change=_save_all_settings, args=(settings_ticker,))
@@ -1070,21 +1331,79 @@ with st.sidebar:
             st.toggle(
                 "📊 RSI閾値適合診断を表示",
                 key=f"{pfx}_show_rsi_diagnosis",
-                on_change=_auto_save_setting,
-                args=(settings_ticker, "show_rsi_diagnosis"),
-                help="ONにすると現在の銘柄のRSI閾値適合診断（早期/遅延反転型）をダッシュボードに表示します。設定は自動保存されます。",
+                on_change=_on_toggle_rsi_diag,
+                args=(settings_ticker,),
+                help="ONにするとRSI閾値適合診断を表示・自動適用します。",
             )
+            if st.session_state.get(f"_diag_confirm_{settings_ticker}_rsi"):
+                _rsi_cm = db.load_diagnosis_cache(settings_ticker, "rsi", st.session_state.get("_period", "1y"))
+                st.warning(_diag_confirm_message(_rsi_cm or {}))
+                _rc1, _rc2 = st.columns(2)
+                if _rc1.button("はい", key=f"confirm_rsi_{settings_ticker}"):
+                    _period_now = st.session_state.get("_period", "1y")
+                    _conf_cache = db.load_diagnosis_cache(settings_ticker, "rsi", _period_now)
+                    _conf_best  = (_conf_cache or {}).get("best_combined", {})
+                    _conf_upd   = {"show_rsi_diagnosis": True}
+                    if _conf_best.get("ob") and _conf_best.get("os"):
+                        _conf_upd["rsi_diag_ob"] = _conf_best["ob"]
+                        _conf_upd["rsi_diag_os"] = _conf_best["os"]
+                    _apply_diag_and_clear_caches(settings_ticker, _conf_upd)
+                    st.session_state[f"_diag_confirm_{settings_ticker}_rsi"] = False
+                    st.session_state[f"{pfx}_show_rsi_diagnosis"] = True
+                    st.rerun()
+                if _rc2.button("いいえ", key=f"cancel_rsi_{settings_ticker}"):
+                    st.session_state[f"_diag_confirm_{settings_ticker}_rsi"] = False
+                    st.rerun()
 
             _use_macd = st.checkbox("MACD", key=f"{pfx}_use_macd",
                                     on_change=_save_all_settings, args=(settings_ticker,))
             if _use_macd:
+                _macd_on = st.session_state.get(f"{pfx}_show_macd_diagnosis", True)
+                if _macd_on:
+                    _macd_c = db.load_diagnosis_cache(
+                        settings_ticker, "macd", st.session_state.get("_period", "1y"))
+                    if _macd_c:
+                        _mb = _macd_c.get("best_combined", {})
+                        if _mb:
+                            st.caption(
+                                f"📊 MACD診断適用中: {_mb.get('label','—')} "
+                                f"(リターン {_mb.get('return_pct', 0):+.1f}%)"
+                            )
                 _c1, _c2, _c3 = st.columns(3)
                 _c1.number_input("Fast",   min_value=3,  max_value=50,  step=1, key=f"{pfx}_macd_fast",
-                                 on_change=_save_all_settings, args=(settings_ticker,))
+                                 on_change=_turn_off_macd_diag, args=(settings_ticker,))
                 _c2.number_input("Slow",   min_value=5,  max_value=100, step=1, key=f"{pfx}_macd_slow",
-                                 on_change=_save_all_settings, args=(settings_ticker,))
+                                 on_change=_turn_off_macd_diag, args=(settings_ticker,))
                 _c3.number_input("Signal", min_value=2,  max_value=30,  step=1, key=f"{pfx}_macd_sig",
-                                 on_change=_save_all_settings, args=(settings_ticker,))
+                                 on_change=_turn_off_macd_diag, args=(settings_ticker,))
+
+            st.toggle(
+                "📊 MACDパラメータ診断を表示",
+                key=f"{pfx}_show_macd_diagnosis",
+                on_change=_on_toggle_macd_diag,
+                args=(settings_ticker,),
+                help="ONにするとMACDパラメータ適合診断を表示・自動適用します。",
+            )
+            if st.session_state.get(f"_diag_confirm_{settings_ticker}_macd"):
+                _macd_cm = db.load_diagnosis_cache(settings_ticker, "macd", st.session_state.get("_period", "1y"))
+                st.warning(_diag_confirm_message(_macd_cm or {}))
+                _mc1, _mc2 = st.columns(2)
+                if _mc1.button("はい", key=f"confirm_macd_{settings_ticker}"):
+                    _period_now = st.session_state.get("_period", "1y")
+                    _conf_cache = db.load_diagnosis_cache(settings_ticker, "macd", _period_now)
+                    _conf_best  = (_conf_cache or {}).get("best_combined", {})
+                    _conf_upd   = {"show_macd_diagnosis": True}
+                    if _conf_best.get("fast") and _conf_best.get("slow") and _conf_best.get("sig"):
+                        _conf_upd["macd_fast"] = _conf_best["fast"]
+                        _conf_upd["macd_slow"] = _conf_best["slow"]
+                        _conf_upd["macd_sig"]  = _conf_best["sig"]
+                    _apply_diag_and_clear_caches(settings_ticker, _conf_upd)
+                    st.session_state[f"_diag_confirm_{settings_ticker}_macd"] = False
+                    st.session_state[f"{pfx}_show_macd_diagnosis"] = True
+                    st.rerun()
+                if _mc2.button("いいえ", key=f"cancel_macd_{settings_ticker}"):
+                    st.session_state[f"_diag_confirm_{settings_ticker}_macd"] = False
+                    st.rerun()
 
             _use_bb = st.checkbox("ボリンジャーバンド", key=f"{pfx}_use_bb",
                                   on_change=_save_all_settings, args=(settings_ticker,))
@@ -1310,6 +1629,7 @@ def create_chart(
     ind_cfg: dict,
     ext_overlays: list[str] | None = None,
     ext_oscillators: list[str] | None = None,
+    trades: pd.DataFrame | None = None,
 ) -> go.Figure:
     ext_overlays = [c for c in (ext_overlays or []) if c in df.columns]
     ext_oscillators = [c for c in (ext_oscillators or []) if c in df.columns]
@@ -1389,15 +1709,101 @@ def create_chart(
     if not buys.empty:
         fig.add_trace(go.Scatter(
             x=buys.index, y=buys["Low"] * 0.99, mode="markers", name="買いシグナル",
-            marker=dict(symbol="triangle-up", color="#ff5252", size=12,
+            marker=dict(symbol="triangle-up", color="#ff5252", size=10,
                         line=dict(width=1, color="white")),
+            opacity=0.5,
         ), row=1, col=1)
     if not sells.empty:
         fig.add_trace(go.Scatter(
             x=sells.index, y=sells["High"] * 1.01, mode="markers", name="売りシグナル",
-            marker=dict(symbol="triangle-down", color="#40c4ff", size=12,
+            marker=dict(symbol="triangle-down", color="#40c4ff", size=10,
                         line=dict(width=1, color="white")),
+            opacity=0.5,
         ), row=1, col=1)
+
+    # ── 実際の売買マーカー ──
+    if trades is not None and not trades.empty:
+        _trade_styles = {
+            "BUY":         dict(symbol="circle",        color="#00e676", size=13, label="実売買（買）"),
+            "SELL":        dict(symbol="circle",        color="#40c4ff", size=13, label="実売買（売）"),
+            "STOP_LOSS":   dict(symbol="x",             color="#ff1744", size=14, label="損切り"),
+            "TAKE_PROFIT": dict(symbol="star",          color="#ffd600", size=14, label="利確"),
+        }
+        for _ttype, _style in _trade_styles.items():
+            _t = trades[trades["type"] == _ttype]
+            if _t.empty:
+                continue
+            # trade の date と df.index を照合して価格を取得
+            _t_dates = _t["date"]
+            _t_prices = _t["price"].values
+            _t_shares = _t["shares"].values
+            _t_profits = _t["profit"].values
+            _is_buy = _ttype == "BUY"
+
+            # ローソク足上下への配置
+            _df_prices = []
+            for _d, _p in zip(_t_dates, _t_prices):
+                if _d in df.index:
+                    _row = df.loc[_d]
+                    _df_prices.append(_row["Low"] * 0.975 if _is_buy else _row["High"] * 1.025)
+                else:
+                    _df_prices.append(_p)
+
+            # 売り系マーカー: 損益に応じて色を変える
+            def _pf_color(pf):
+                if pf is None or pd.isna(pf):
+                    return _style["color"]
+                return "#00e676" if pf >= 0 else "#ff1744"
+
+            def _pf_label(pf):
+                """マーカー上の短い損益テキスト (+15k / -8k など)"""
+                if pf is None or pd.isna(pf):
+                    return ""
+                sign = "+" if pf >= 0 else ""
+                if abs(pf) >= 1_000_000:
+                    return f"{sign}{pf/1_000_000:.1f}M"
+                elif abs(pf) >= 1_000:
+                    return f"{sign}{pf/1_000:.0f}k"
+                return f"{sign}{pf:.0f}"
+
+            if _is_buy:
+                _marker_colors = [_style["color"]] * len(_t)
+                _marker_texts  = ["B"] * len(_t)
+                _text_colors   = ["black"] * len(_t)
+                _text_pos      = "middle center"
+            else:
+                _marker_colors = [_pf_color(pf) for pf in _t_profits]
+                _short_label   = {"SELL": "S", "STOP_LOSS": "SL", "TAKE_PROFIT": "TP"}[_ttype]
+                _marker_texts  = [
+                    f"{_short_label} {_pf_label(pf)}" for pf in _t_profits
+                ]
+                _text_colors   = [
+                    "#00e676" if (pf is not None and not pd.isna(pf) and pf >= 0) else "#ff1744"
+                    for pf in _t_profits
+                ]
+                _text_pos = "top center"
+
+            _hover = [
+                (f"{_ttype}<br>価格: ¥{p:,.0f}<br>株数: {int(s)}"
+                 + (f"<br>損益: ¥{pf:,.0f}" if pf is not None and not pd.isna(pf) else ""))
+                for p, s, pf in zip(_t_prices, _t_shares, _t_profits)
+            ]
+            fig.add_trace(go.Scatter(
+                x=_t_dates, y=_df_prices,
+                mode="markers+text",
+                name=_style["label"],
+                text=_marker_texts,
+                textposition=_text_pos,
+                textfont=dict(size=8, color=_text_colors),
+                marker=dict(
+                    symbol=_style["symbol"],
+                    color=_marker_colors,
+                    size=_style["size"],
+                    line=dict(width=1.5, color="white"),
+                ),
+                hovertext=_hover,
+                hoverinfo="text",
+            ), row=1, col=1)
 
     current_row = 2
 
@@ -1839,15 +2245,17 @@ for ticker in tickers:
                         df[_c] = df_ext[_c]
         _chart_ext_overlays    = list(dict.fromkeys(_chart_ext_overlays))
         _chart_ext_oscillators = list(dict.fromkeys(_chart_ext_oscillators))
+        _trades_df = result.get("trades") if result else None
         fig = create_chart(df, ticker, ic,
                            ext_overlays=_chart_ext_overlays,
-                           ext_oscillators=_chart_ext_oscillators)
-        st.plotly_chart(fig, use_container_width=True)
+                           ext_oscillators=_chart_ext_oscillators,
+                           trades=_trades_df)
+        st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": True, "scrollZoom": True})
 
         # ─── ポートフォリオ推移 ───
         if not result["portfolio_curve"].empty:
             fig_pf = create_portfolio_chart(result["portfolio_curve"], initial_cash)
-            st.plotly_chart(fig_pf, use_container_width=True)
+            st.plotly_chart(fig_pf, use_container_width=True, config={"displayModeBar": True, "scrollZoom": True})
 
         # ─── 空売り・スクイーズ分析 ───
         _sp_danger  = _s.get("sell_pressure_danger",  0.50)
@@ -1933,7 +2341,7 @@ for ticker in tickers:
                     yaxis=dict(range=[0, 1]),
                     legend=dict(orientation="h", yanchor="top", y=-0.2, xanchor="center", x=0.5),
                 )
-                st.plotly_chart(fig_ss, use_container_width=True)
+                st.plotly_chart(fig_ss, use_container_width=True, config={"displayModeBar": True, "scrollZoom": True})
 
             st.caption(
                 "空売り圧力：大出来高を伴う下落の累積強度（0〜1）。"
@@ -2115,7 +2523,7 @@ for ticker in tickers:
                     "元の指標", f"拡張指標（{len(ext_bt_state['checked'])}種）",
                     initial_cash,
                 )
-                st.plotly_chart(fig_cmp, use_container_width=True)
+                st.plotly_chart(fig_cmp, use_container_width=True, config={"displayModeBar": True, "scrollZoom": True})
 
             # 取引履歴（拡張）
             if not er["trades"].empty:
@@ -2154,9 +2562,20 @@ for ticker in tickers:
                     if _tf_df is not None:
                         with st.spinner("各MA設定でバックテスト実行中..."):
                             _tf_ic = _s.get("initial_cash", 1_000_000)
-                            _tf_result = analyze_timeframe(_tf_df, initial_cash=_tf_ic)
+                            _tf_result = analyze_timeframe(_tf_df, initial_cash=_tf_ic, indicator_config=_build_indicator_config(_s))
                             db.save_diagnosis_cache(ticker, "timeframe", period, _tf_result)
                             st.session_state[_tf_key] = _tf_result
+                            # トグルON時・初回診断: 自動適用フラグ処理
+                            if st.session_state.pop(f"_diag_auto_apply_{ticker}_timeframe", False):
+                                if _is_diag_effective(_tf_result):
+                                    _ab = _tf_result.get("best_combined", {})
+                                    if _ab.get("short") and _ab.get("long"):
+                                        _apply_diag_and_clear_caches(ticker, {
+                                            "ma_short": _ab["short"], "ma_long": _ab["long"], "use_ma": True,
+                                        })
+                                        st.rerun()
+                                else:
+                                    st.session_state[f"_diag_inline_confirm_{ticker}_timeframe"] = True
 
             if st.button("🔄 再診断", key=f"run_tf_{ticker}", help="最新データで再診断してDBに保存します"):
                 _tf_df = st.session_state.get(f"df_{ticker}", None)
@@ -2169,11 +2588,30 @@ for ticker in tickers:
                 if _tf_df is not None:
                     with st.spinner("各MA設定でバックテスト実行中..."):
                         _tf_ic = _s.get("initial_cash", 1_000_000)
-                        _tf_result = analyze_timeframe(_tf_df, initial_cash=_tf_ic)
+                        _tf_result = analyze_timeframe(_tf_df, initial_cash=_tf_ic, indicator_config=_build_indicator_config(_s))
                         db.save_diagnosis_cache(ticker, "timeframe", period, _tf_result)
                         st.session_state[_tf_key] = _tf_result
 
             tf_res = st.session_state.get(_tf_key)
+            # インライン確認UI（初回診断が無効だった場合）
+            if st.session_state.get(f"_diag_inline_confirm_{ticker}_timeframe") and tf_res:
+                st.warning(_diag_confirm_message(tf_res))
+                _ic1, _ic2 = st.columns(2)
+                if _ic1.button("はい", key=f"inline_ok_tf_{ticker}"):
+                    _ib = (tf_res or {}).get("best_combined", {})
+                    _iupd = {"show_timeframe_diagnosis": True}
+                    if _ib.get("short") and _ib.get("long"):
+                        _iupd["ma_short"] = _ib["short"]; _iupd["ma_long"] = _ib["long"]; _iupd["use_ma"] = True
+                    _apply_diag_and_clear_caches(ticker, _iupd)
+                    st.session_state.pop(f"_diag_inline_confirm_{ticker}_timeframe", None)
+                    st.rerun()
+                if _ic2.button("いいえ", key=f"inline_ng_tf_{ticker}"):
+                    _irv = {**db.DEFAULT_SETTINGS, **db.load_settings(ticker)}
+                    _irv["show_timeframe_diagnosis"] = False
+                    db.save_settings(ticker, _irv)
+                    st.session_state[f"cfg_{ticker}_show_timeframe_diagnosis"] = False
+                    st.session_state.pop(f"_diag_inline_confirm_{ticker}_timeframe", None)
+                    st.rerun()
             if tf_res:
                 if tf_res.get("_cached_at"):
                     st.caption(f"キャッシュ使用（本日 {tf_res['_cached_at']} 更新）")
@@ -2187,41 +2625,13 @@ for ticker in tickers:
                     dom = regime["dominant"]
                     badge = "📈" if dom == "SHORT_TERM" else ("📉" if dom == "LONG_TERM" else "↔️")
 
-                    _rc1, _rc2, _rc3 = st.columns([1, 2, 1])
+                    _rc1, _rc2 = st.columns([1, 2])
                     _rc1.metric("レジーム判定", f"{badge} {rlabel}")
                     _rc2.metric(
                         "推奨MA設定",
                         best["label"],
                         f"リターン {best['return_pct']:+.2f}% / PF {best['profit_factor']:.2f}",
                     )
-                    if _rc3.button(
-                        "⭐ この設定を適用",
-                        key=f"apply_tf_{ticker}",
-                        type="primary",
-                        help=f"短期MA={best['short']} / 長期MA={best['long']} をこの銘柄に適用してDBに保存します",
-                    ):
-                        _pfx = f"cfg_{ticker}"
-                        _apply_s = {
-                            _k: st.session_state.get(f"{_pfx}_{_k}", db.DEFAULT_SETTINGS[_k])
-                            for _k in db.DEFAULT_SETTINGS if _k != "extra_checked"
-                        }
-                        _apply_s["ma_short"] = best["short"]
-                        _apply_s["ma_long"]  = best["long"]
-                        _apply_s["use_ma"]   = True
-                        _apply_s["extra_checked"] = [
-                            _cn
-                            for _, _grp in _SIDEBAR_EXTRA_GROUPS
-                            for _, _cn in _grp
-                            if st.session_state.get(f"{_pfx}_ext_{_cn}", False)
-                        ]
-                        db.save_settings(ticker, _apply_s)
-                        st.session_state.pop(f"_cfg_init_{ticker}", None)
-                        for _ck in [k for k in list(st.session_state.keys())
-                                    if ticker in k and any(k.startswith(p) for p in
-                                       ("df_", "bt_summary_", "opt_", "corr_cache_", "df_ext_"))]:
-                            st.session_state.pop(_ck, None)
-                        st.success(f"MA設定を適用しました（短期={best['short']} / 長期={best['long']}）")
-                        st.rerun()
 
                     # ── MA設定別バックテスト比較表 ──
                     st.markdown("**MA設定別バックテスト比較**")
@@ -2236,7 +2646,12 @@ for ticker in tickers:
                             "PF":         c["profit_factor"],
                             "最大DD(%)":  c["max_dd_pct"],
                         })
-                    _cfg_df = pd.DataFrame(_cfg_rows)
+                    _tf_baseline_row = {
+                        "MA設定":     "📍 " + tf_res.get("baseline_label", "現在の設定"),
+                        "リターン(%)": tf_res.get("baseline_return_pct", 0.0),
+                        "勝率(%)":    "-", "取引回数": "-", "PF": "-", "最大DD(%)": "-",
+                    }
+                    _cfg_df = pd.DataFrame([_tf_baseline_row] + _cfg_rows)
 
                     def _color_return(val):
                         if isinstance(val, float):
@@ -2305,9 +2720,20 @@ for ticker in tickers:
                     if _rsi_df is not None:
                         with st.spinner("各RSI閾値でバックテスト実行中..."):
                             _rsi_ic = _s.get("initial_cash", 1_000_000)
-                            _rsi_result = analyze_rsi(_rsi_df, initial_cash=_rsi_ic)
+                            _rsi_result = analyze_rsi(_rsi_df, initial_cash=_rsi_ic, indicator_config=_build_indicator_config(_s))
                             db.save_diagnosis_cache(ticker, "rsi", period, _rsi_result)
                             st.session_state[_rsi_key] = _rsi_result
+                            # トグルON時・初回診断: 自動適用フラグ処理
+                            if st.session_state.pop(f"_diag_auto_apply_{ticker}_rsi", False):
+                                if _is_diag_effective(_rsi_result):
+                                    _ab = _rsi_result.get("best_combined", {})
+                                    if _ab.get("ob") and _ab.get("os"):
+                                        _apply_diag_and_clear_caches(ticker, {
+                                            "rsi_diag_ob": _ab["ob"], "rsi_diag_os": _ab["os"],
+                                        })
+                                        st.rerun()
+                                else:
+                                    st.session_state[f"_diag_inline_confirm_{ticker}_rsi"] = True
 
             if st.button("🔄 再診断", key=f"run_rsi_{ticker}", help="最新データで再診断してDBに保存します"):
                 _rsi_df = st.session_state.get(f"df_{ticker}", None)
@@ -2320,11 +2746,30 @@ for ticker in tickers:
                 if _rsi_df is not None:
                     with st.spinner("各RSI閾値でバックテスト実行中..."):
                         _rsi_ic = _s.get("initial_cash", 1_000_000)
-                        _rsi_result = analyze_rsi(_rsi_df, initial_cash=_rsi_ic)
+                        _rsi_result = analyze_rsi(_rsi_df, initial_cash=_rsi_ic, indicator_config=_build_indicator_config(_s))
                         db.save_diagnosis_cache(ticker, "rsi", period, _rsi_result)
                         st.session_state[_rsi_key] = _rsi_result
 
             rsi_res = st.session_state.get(_rsi_key)
+            # インライン確認UI（初回診断が無効だった場合）
+            if st.session_state.get(f"_diag_inline_confirm_{ticker}_rsi") and rsi_res:
+                st.warning(_diag_confirm_message(rsi_res))
+                _ic1, _ic2 = st.columns(2)
+                if _ic1.button("はい", key=f"inline_ok_rsi_{ticker}"):
+                    _ib = (rsi_res or {}).get("best_combined", {})
+                    _iupd = {"show_rsi_diagnosis": True}
+                    if _ib.get("ob") and _ib.get("os"):
+                        _iupd["rsi_diag_ob"] = _ib["ob"]; _iupd["rsi_diag_os"] = _ib["os"]
+                    _apply_diag_and_clear_caches(ticker, _iupd)
+                    st.session_state.pop(f"_diag_inline_confirm_{ticker}_rsi", None)
+                    st.rerun()
+                if _ic2.button("いいえ", key=f"inline_ng_rsi_{ticker}"):
+                    _irv = {**db.DEFAULT_SETTINGS, **db.load_settings(ticker)}
+                    _irv["show_rsi_diagnosis"] = False
+                    db.save_settings(ticker, _irv)
+                    st.session_state[f"cfg_{ticker}_show_rsi_diagnosis"] = False
+                    st.session_state.pop(f"_diag_inline_confirm_{ticker}_rsi", None)
+                    st.rerun()
             if rsi_res:
                 if rsi_res.get("_cached_at"):
                     st.caption(f"キャッシュ使用（本日 {rsi_res['_cached_at']} 更新）")
@@ -2337,43 +2782,22 @@ for ticker in tickers:
                     dom = reversal["dominant"]
                     badge = "⚡" if dom == "EARLY_REVERSAL" else ("🐢" if dom == "LATE_REVERSAL" else "↔️")
 
-                    _rc1, _rc2, _rc3 = st.columns([1, 2, 1])
+                    _rc1, _rc2 = st.columns([1, 2])
                     _rc1.metric("銘柄タイプ", f"{badge} {rlabel}")
                     _rc2.metric(
                         "推奨RSI設定",
                         best["label"],
                         f"リターン {best['return_pct']:+.2f}% / PF {best['profit_factor']:.2f}",
                     )
-                    if _rc3.button(
-                        "⭐ この設定を適用",
-                        key=f"apply_rsi_{ticker}",
-                        type="primary",
-                        help=f"買われすぎ={best['ob']} / 売られすぎ={best['os']} をコンテキスト方式に適用してDBに保存します",
-                    ):
-                        _pfx = f"cfg_{ticker}"
-                        _apply_s = {
-                            _k: st.session_state.get(f"{_pfx}_{_k}", db.DEFAULT_SETTINGS[_k])
-                            for _k in db.DEFAULT_SETTINGS if _k != "extra_checked"
-                        }
-                        _apply_s["rsi_diag_ob"] = best["ob"]
-                        _apply_s["rsi_diag_os"] = best["os"]
-                        _apply_s["extra_checked"] = [
-                            _cn
-                            for _, _grp in _SIDEBAR_EXTRA_GROUPS
-                            for _, _cn in _grp
-                            if st.session_state.get(f"{_pfx}_ext_{_cn}", False)
-                        ]
-                        db.save_settings(ticker, _apply_s)
-                        st.session_state.pop(f"_cfg_init_{ticker}", None)
-                        for _ck in [k for k in list(st.session_state.keys())
-                                    if ticker in k and any(k.startswith(p) for p in
-                                       ("df_", "bt_summary_", "opt_", "corr_cache_", "df_ext_"))]:
-                            st.session_state.pop(_ck, None)
-                        st.success(
-                            f"RSI設定を適用しました（買われすぎ={best['ob']} / 売られすぎ={best['os']}）"
-                            "  コンテキスト方式ONの場合に有効です。"
+
+                    # ── 全プリセットがマイナスリターンの場合の警告 ──
+                    _all_negative_rsi = all(c["return_pct"] <= 0 for c in rsi_res["configs"])
+                    if _all_negative_rsi:
+                        st.warning(
+                            "⚠️ 全プリセットでリターンがマイナスです。"
+                            " 診断トグルをONにして「はい」を選択すると、診断値を適用できます"
+                            "（パフォーマンスは保証されません）。"
                         )
-                        st.rerun()
 
                     # ── RSI設定別バックテスト比較表 ──
                     def _color_rsi_val(val):
@@ -2393,7 +2817,12 @@ for ticker in tickers:
                             "PF":         c["profit_factor"],
                             "最大DD(%)":  c["max_dd_pct"],
                         })
-                    _rsi_df2 = pd.DataFrame(_rsi_rows)
+                    _rsi_baseline_row = {
+                        "RSI設定":    "📍 " + rsi_res.get("baseline_label", "現在の設定"),
+                        "リターン(%)": rsi_res.get("baseline_return_pct", 0.0),
+                        "勝率(%)":    "-", "取引回数": "-", "PF": "-", "最大DD(%)": "-",
+                    }
+                    _rsi_df2 = pd.DataFrame([_rsi_baseline_row] + _rsi_rows)
                     st.dataframe(
                         _rsi_df2.style.map(_color_rsi_val, subset=["リターン(%)", "最大DD(%)"]),
                         hide_index=True,
@@ -2415,6 +2844,168 @@ for ticker in tickers:
                     st.caption(
                         "⚠️ この診断は過去データに基づく参考値です。"
                         " 適用後はコンテキスト方式をONにすると選択した閾値が使用されます。"
+                    )
+
+        # ─── MACDパラメータ適合診断（アクティブ銘柄のみ）───
+        if _s.get("show_macd_diagnosis", False):
+            st.divider()
+            _macd_key = f"macd_result_{ticker}_{period}"
+            _macd_cname = _get_company_name(ticker)
+            _macd_cname_str = f"  {_macd_cname}" if _macd_cname != ticker else ""
+            st.subheader(f"📊 MACDパラメータ診断: {ticker}{_macd_cname_str}")
+            st.caption(
+                "4種類のMACDパラメータ設定でバックテストを比較し、"
+                "この銘柄が短期クロス型か長期トレンド型かを診断します。"
+            )
+            # キャッシュ自動ロード（起動時に保存済みのはず）
+            if st.session_state.get(_macd_key) is None:
+                _cached_macd = db.load_diagnosis_cache(ticker, "macd", period)
+                if _cached_macd is not None:
+                    st.session_state[_macd_key] = _cached_macd
+                else:
+                    _macd_df = st.session_state.get(f"df_{ticker}", None)
+                    if _macd_df is None:
+                        try:
+                            _macd_df = get_stock_data(ticker, period=period)
+                        except Exception as _e:
+                            st.error(f"データ取得エラー: {_e}")
+                            _macd_df = None
+                    if _macd_df is not None:
+                        with st.spinner("各MACDパラメータでバックテスト実行中..."):
+                            _macd_ic  = _s.get("initial_cash", 1_000_000)
+                            _macd_cfg = _build_indicator_config(_s)
+                            _macd_result = analyze_macd(_macd_df, initial_cash=_macd_ic, indicator_config=_macd_cfg)
+                            db.save_diagnosis_cache(ticker, "macd", period, _macd_result)
+                            st.session_state[_macd_key] = _macd_result
+                            # トグルON時・初回診断: 自動適用フラグ処理
+                            if st.session_state.pop(f"_diag_auto_apply_{ticker}_macd", False):
+                                if _is_diag_effective(_macd_result):
+                                    _ab = _macd_result.get("best_combined", {})
+                                    if _ab.get("fast") and _ab.get("slow") and _ab.get("sig"):
+                                        _apply_diag_and_clear_caches(ticker, {
+                                            "macd_fast": _ab["fast"], "macd_slow": _ab["slow"], "macd_sig": _ab["sig"],
+                                        })
+                                        st.rerun()
+                                else:
+                                    st.session_state[f"_diag_inline_confirm_{ticker}_macd"] = True
+
+            if st.button("🔄 再診断", key=f"run_macd_{ticker}", help="最新データで再診断してDBに保存します"):
+                _macd_df = st.session_state.get(f"df_{ticker}", None)
+                if _macd_df is None:
+                    try:
+                        _macd_df = get_stock_data(ticker, period=period)
+                    except Exception as _e:
+                        st.error(f"データ取得エラー: {_e}")
+                        _macd_df = None
+                if _macd_df is not None:
+                    with st.spinner("各MACDパラメータでバックテスト実行中..."):
+                        _macd_ic  = _s.get("initial_cash", 1_000_000)
+                        _macd_cfg = _build_indicator_config(_s)
+                        _macd_result = analyze_macd(_macd_df, initial_cash=_macd_ic, indicator_config=_macd_cfg)
+                        db.save_diagnosis_cache(ticker, "macd", period, _macd_result)
+                        st.session_state[_macd_key] = _macd_result
+
+            macd_res = st.session_state.get(_macd_key)
+            # インライン確認UI（初回診断が無効だった場合）
+            if st.session_state.get(f"_diag_inline_confirm_{ticker}_macd") and macd_res:
+                st.warning(_diag_confirm_message(macd_res))
+                _ic1, _ic2 = st.columns(2)
+                if _ic1.button("はい", key=f"inline_ok_macd_{ticker}"):
+                    _ib = (macd_res or {}).get("best_combined", {})
+                    _iupd = {"show_macd_diagnosis": True}
+                    if _ib.get("fast") and _ib.get("slow") and _ib.get("sig"):
+                        _iupd["macd_fast"] = _ib["fast"]; _iupd["macd_slow"] = _ib["slow"]; _iupd["macd_sig"] = _ib["sig"]
+                    _apply_diag_and_clear_caches(ticker, _iupd)
+                    st.session_state.pop(f"_diag_inline_confirm_{ticker}_macd", None)
+                    st.rerun()
+                if _ic2.button("いいえ", key=f"inline_ng_macd_{ticker}"):
+                    _irv = {**db.DEFAULT_SETTINGS, **db.load_settings(ticker)}
+                    _irv["show_macd_diagnosis"] = False
+                    db.save_settings(ticker, _irv)
+                    st.session_state[f"cfg_{ticker}_show_macd_diagnosis"] = False
+                    st.session_state.pop(f"_diag_inline_confirm_{ticker}_macd", None)
+                    st.rerun()
+            if macd_res:
+                if macd_res.get("_cached_at"):
+                    st.caption(f"キャッシュ使用（本日 {macd_res['_cached_at']} 更新）")
+                if "error" in macd_res:
+                    st.error(macd_res["error"])
+                else:
+                    cross = macd_res["cross"]
+                    best = macd_res["best_combined"]
+                    clabel = macd_res["cross_label"]
+                    dom = cross["dominant"]
+                    badge = "⚡" if dom == "SHORT_TERM" else ("🐢" if dom == "LONG_TERM" else "↔️")
+
+                    _mc1, _mc2 = st.columns([1, 2])
+                    _mc1.metric("銘柄タイプ", f"{badge} {clabel}")
+                    _mc2.metric(
+                        "推奨MACD設定",
+                        best["label"],
+                        f"リターン {best['return_pct']:+.2f}% / PF {best['profit_factor']:.2f}",
+                    )
+
+                    # ── ATRベースSL情報 ──
+                    _macd_atr = macd_res.get("atr_pct")
+                    _macd_sl  = macd_res.get("stop_loss_pct")
+                    if _macd_atr is not None and _macd_sl is not None:
+                        st.caption(
+                            f"診断用SL: {_macd_sl:.1f}%（ATR {_macd_atr:.1f}% × 2倍、最小5%・最大15%）"
+                        )
+
+                    # ── 全プリセットがマイナスリターンの場合の警告 ──
+                    _all_negative = all(c["return_pct"] <= 0 for c in macd_res["configs"])
+                    if _all_negative:
+                        st.warning(
+                            "⚠️ 全プリセットでリターンがマイナスです。"
+                            " 診断トグルをONにして「はい」を選択すると、診断値を適用できます"
+                            "（パフォーマンスは保証されません）。"
+                        )
+
+                    # ── MACDパラメータ別バックテスト比較表 ──
+                    def _color_macd_val(val):
+                        if isinstance(val, float):
+                            return f"color: {'#00cc66' if val > 0 else '#ff4444'}"
+                        return ""
+
+                    st.markdown("**MACDパラメータ別バックテスト比較**")
+                    _macd_rows = []
+                    for c in macd_res["configs"]:
+                        is_best = c["label"] == best["label"]
+                        _macd_rows.append({
+                            "MACD設定":   ("★ " if is_best else "") + c["label"],
+                            "リターン(%)": c["return_pct"],
+                            "勝率(%)":    c["win_rate_pct"],
+                            "取引回数":   c["trade_count"],
+                            "PF":         c["profit_factor"],
+                            "最大DD(%)":  c["max_dd_pct"],
+                        })
+                    _macd_baseline_row = {
+                        "MACD設定":   "📍 " + macd_res.get("baseline_label", "現在の設定"),
+                        "リターン(%)": macd_res.get("baseline_return_pct", 0.0),
+                        "勝率(%)":    "-", "取引回数": "-", "PF": "-", "最大DD(%)": "-",
+                    }
+                    _macd_df2 = pd.DataFrame([_macd_baseline_row] + _macd_rows)
+                    st.dataframe(
+                        _macd_df2.style.map(_color_macd_val, subset=["リターン(%)", "最大DD(%)"]),
+                        hide_index=True,
+                        use_container_width=True,
+                    )
+
+                    # ── クロス傾向スコア詳細 ──
+                    st.markdown("**クロス傾向スコア詳細**")
+                    _cross_rows = []
+                    for k, v in cross["details"].items():
+                        _cross_rows.append({
+                            "指標":  {"cross_freq": "クロス頻度", "zero_run": "ゼロライン滞在"}.get(k, k),
+                            "値":    v["value"],
+                            "詳細":  v["desc"],
+                        })
+                    st.dataframe(pd.DataFrame(_cross_rows), hide_index=True, use_container_width=True)
+
+                    st.caption(
+                        "⚠️ この診断は過去データに基づく参考値です。"
+                        " 診断トグルがONの間は推奨設定が自動で有効設定に反映されます。"
                     )
 
         st.divider()

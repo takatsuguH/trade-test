@@ -94,6 +94,8 @@ DEFAULT_SETTINGS: dict = {
     # RSI閾値診断で選択されたプリセット (ob/os)
     "rsi_diag_ob": 70,
     "rsi_diag_os": 30,
+    # MACDパラメータ適合診断の表示
+    "show_macd_diagnosis": True,
 }
 
 

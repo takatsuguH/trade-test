@@ -184,6 +184,12 @@ class StrategyEngine:
             threshold = (df["BB_mid"].abs() * 0.0001).fillna(0.01)
             signal[df["MACD"].abs() < threshold] = 0
 
+        # クロス多発フィルター：直近10日で3回以上クロス → レンジ判定でスキップ
+        if "MACD_vote" in df.columns:
+            _cross = (df["MACD_vote"].diff().fillna(0).abs() >= 2).astype(int)
+            _cross_count = _cross.rolling(10, min_periods=1).sum()
+            signal[_cross_count >= 3] = 0
+
         return signal
 
 

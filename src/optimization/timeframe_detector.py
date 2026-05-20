@@ -176,6 +176,7 @@ def _compute_regime_score(df: pd.DataFrame) -> dict:
 def analyze_timeframe(
     df: pd.DataFrame,
     initial_cash: float = 1_000_000,
+    indicator_config: dict | None = None,
 ) -> dict:
     """
     銘柄の時間軸適合性を診断する。
@@ -185,10 +186,20 @@ def analyze_timeframe(
         best      : 最高リターンのMA設定
         regime    : レジームスコア詳細
         recommendation: 推奨MA設定（バックテスト＋レジームスコアの総合）
+        baseline_return_pct: 現在の手動MA設定でのリターン（比較用）
+        baseline_label     : 現在の設定ラベル
     """
     base_df = df[["Open", "High", "Low", "Close", "Volume"]].dropna().copy()
     if len(base_df) < 60:
         return {"error": "データが不足しています（最低60日必要）"}
+
+    # ベースライン: 現在の手動MA設定でBT（有効性比較用）
+    _ic = indicator_config or {}
+    _cur_short = int(_ic.get("ma_short", 5))
+    _cur_long  = int(_ic.get("ma_long",  25))
+    _baseline  = _run_ma_backtest(base_df, _cur_short, _cur_long, initial_cash)
+    baseline_return_pct = _baseline["return_pct"]
+    baseline_label = f"現在の設定 ({_cur_short}/{_cur_long})"
 
     # 各MAプリセットでバックテスト
     configs = []
@@ -225,9 +236,11 @@ def analyze_timeframe(
     }.get(regime["dominant"], "不明")
 
     return {
-        "configs":         configs,
-        "best_backtest":   best_bt,
-        "best_combined":   best_combined,
-        "regime":          regime,
-        "regime_label":    regime_label,
+        "configs":             configs,
+        "best_backtest":       best_bt,
+        "best_combined":       best_combined,
+        "regime":              regime,
+        "regime_label":        regime_label,
+        "baseline_return_pct": baseline_return_pct,
+        "baseline_label":      baseline_label,
     }
