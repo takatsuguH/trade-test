@@ -80,8 +80,8 @@ class IndicatorEvaluator:
     def evaluate_RSI(
         df: pd.DataFrame,
         market_state: pd.Series,
-        rsi_ob: int = 70,
-        rsi_os: int = 30,
+        rsi_ob: int = 60,
+        rsi_os: int = 35,
     ) -> pd.Series:
         """エントリータイミング役割：相場状態別 RSI → ±2"""
         score = pd.Series(0, index=df.index, dtype=float)
@@ -157,8 +157,8 @@ class StrategyEngine:
         signal: pd.Series,
         df: pd.DataFrame,
         market_state: pd.Series,
-        rsi_ob: int = 70,
-        rsi_os: int = 30,
+        rsi_ob: int = 60,
+        rsi_os: int = 35,
     ) -> pd.Series:
         """TREND相場でのRSI過熱・売られすぎエントリーを禁止。"""
         signal = signal.copy()
@@ -199,8 +199,8 @@ class SignalGenerator:
     def __init__(
         self,
         score_threshold: int = _DEFAULT_THRESHOLD,
-        rsi_ob: int = 70,
-        rsi_os: int = 30,
+        rsi_ob: int = 60,
+        rsi_os: int = 35,
     ):
         self.score_threshold = score_threshold
         self.rsi_ob = rsi_ob
@@ -258,8 +258,8 @@ def generate_context_signal(
     active: list[str],
     extra_sig_cols: list[str] | None = None,
     score_threshold: int = _DEFAULT_THRESHOLD,
-    rsi_ob: int = 70,
-    rsi_os: int = 30,
+    rsi_ob: int = 60,
+    rsi_os: int = 35,
 ) -> pd.DataFrame:
     """
     app.py の merge_all_signals / generate_composite_signal と互換の公開関数。

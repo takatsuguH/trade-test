@@ -12,8 +12,8 @@ from src.analysis.correlation import analyze_correlations, INDICATOR_META
 from src.optimization.searcher import find_best_combination
 
 cfg = {
-    "use_ma": True, "ma_short": 5, "ma_long": 25,
-    "use_rsi": True, "rsi_period": 14, "rsi_ob": 70, "rsi_os": 30,
+    "use_ma": True, "ma_short": 25, "ma_long": 75,
+    "use_rsi": True, "rsi_period": 14, "rsi_ob": 60, "rsi_os": 35,
     "use_macd": True, "macd_fast": 12, "macd_slow": 26, "macd_sig": 9,
     "use_bb": True, "bb_period": 20, "bb_std": 2.0,
 }

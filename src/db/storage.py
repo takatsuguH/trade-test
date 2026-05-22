@@ -1,6 +1,7 @@
 """SQLite-backed persistent storage for stocks and per-ticker indicator settings."""
 import sqlite3
 import json
+import hashlib
 from datetime import datetime
 from pathlib import Path
 
@@ -12,8 +13,8 @@ DEFAULT_GLOBAL: dict = {
 
 DEFAULT_SETTINGS: dict = {
     # メイン4指標
-    "use_ma": True,   "ma_short": 5,     "ma_long": 25,
-    "use_rsi": True,  "rsi_period": 14,  "rsi_ob": 70,  "rsi_os": 30,
+    "use_ma": True,   "ma_short": 25,    "ma_long": 75,
+    "use_rsi": True,  "rsi_period": 14,  "rsi_ob": 60,  "rsi_os": 35,
     "use_macd": True, "macd_fast": 12,   "macd_slow": 26, "macd_sig": 9,
     "use_bb": True,   "bb_period": 20,   "bb_std": 2.0,
     # 追加指標チェック状態
@@ -145,6 +146,27 @@ def init_db() -> None:
                 updated_at  TEXT DEFAULT (datetime('now','localtime')),
                 PRIMARY KEY (stock_code, diag_type, data_period)
             );
+            CREATE TABLE IF NOT EXISTS wf_diagnosis_cache (
+                stock_code   TEXT NOT NULL,
+                diag_type    TEXT NOT NULL,
+                end_date     TEXT NOT NULL,
+                params_hash  TEXT NOT NULL,
+                algo_version TEXT NOT NULL,
+                result_json  TEXT NOT NULL,
+                is_effective INTEGER NOT NULL,
+                updated_at   TEXT DEFAULT (datetime('now','localtime')),
+                PRIMARY KEY (stock_code, diag_type, end_date, params_hash, algo_version)
+            );
+            CREATE TABLE IF NOT EXISTS wf_seven_way_cache (
+                stock_code   TEXT NOT NULL,
+                combo_key    TEXT NOT NULL,
+                end_date     TEXT NOT NULL,
+                params_hash  TEXT NOT NULL,
+                algo_version TEXT NOT NULL,
+                result_json  TEXT NOT NULL,
+                updated_at   TEXT DEFAULT (datetime('now','localtime')),
+                PRIMARY KEY (stock_code, combo_key, end_date, params_hash, algo_version)
+            );
         """)
 
 
@@ -271,3 +293,140 @@ def save_diagnosis_cache(stock_code: str, diag_type: str, data_period: str, resu
                 (stock_code, diag_type, data_period, result_json, updated_at)
             VALUES (?, ?, ?, ?, datetime('now','localtime'))
         """, (stock_code, diag_type, data_period, json.dumps(clean, ensure_ascii=False)))
+
+
+# ── ウォークフォワード診断キャッシュ ──────────────────────────────────────
+# end_date 単位で診断結果を保存し、頻度違い (日次/週次/月次) で共有する。
+# キャッシュキー: (stock_code, diag_type, end_date, params_hash, algo_version)
+
+def compute_wf_params_hash(indicator_config: dict, initial_cash: float) -> str:
+    """WFキャッシュキー用のパラメータハッシュ。
+    indicator_config（ベースIC: ma/rsi/macd/bb の use_* と数値）+ initial_cash を
+    正規化JSONにしてSHA-256。
+    """
+    payload = {
+        "ic": {k: indicator_config[k] for k in sorted(indicator_config.keys())},
+        "initial_cash": float(initial_cash),
+    }
+    s = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(s.encode("utf-8")).hexdigest()[:16]
+
+
+def load_wf_cache_batch(
+    stock_code: str, diag_type: str, end_dates: list[str],
+    params_hash: str, algo_version: str,
+) -> dict[str, dict]:
+    """指定 end_date 一覧に対する既存キャッシュをまとめて取得。
+    戻り値: {end_date: result_dict (is_effective を含む)}。ヒットしなかった日付はキーに含まれない。
+    """
+    if not end_dates:
+        return {}
+    placeholders = ",".join("?" * len(end_dates))
+    sql = f"""
+        SELECT end_date, result_json, is_effective FROM wf_diagnosis_cache
+        WHERE stock_code = ? AND diag_type = ? AND params_hash = ? AND algo_version = ?
+          AND end_date IN ({placeholders})
+    """
+    params = [stock_code, diag_type, params_hash, algo_version, *end_dates]
+    out: dict[str, dict] = {}
+    with _conn() as conn:
+        for row in conn.execute(sql, params).fetchall():
+            r = json.loads(row["result_json"])
+            r["is_effective"] = bool(row["is_effective"])
+            out[row["end_date"]] = r
+    return out
+
+
+def save_wf_cache(
+    stock_code: str, diag_type: str, end_date: str,
+    params_hash: str, algo_version: str,
+    result: dict, is_effective: bool,
+) -> None:
+    """1件のWF診断結果を保存する（_* プレフィクスのメタキーは除去）。"""
+    clean = {k: v for k, v in result.items() if not k.startswith("_") and k != "is_effective"}
+    with _conn() as conn:
+        conn.execute("""
+            INSERT OR REPLACE INTO wf_diagnosis_cache
+                (stock_code, diag_type, end_date, params_hash, algo_version,
+                 result_json, is_effective, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now','localtime'))
+        """, (
+            stock_code, diag_type, end_date, params_hash, algo_version,
+            json.dumps(clean, ensure_ascii=False),
+            1 if is_effective else 0,
+        ))
+
+
+def count_wf_cache(stock_code: str, params_hash: str, algo_version: str) -> dict[str, int]:
+    """銘柄ごとのキャッシュ件数を diag_type 別に返す（UI表示用）。"""
+    with _conn() as conn:
+        rows = conn.execute("""
+            SELECT diag_type, COUNT(*) AS n FROM wf_diagnosis_cache
+            WHERE stock_code = ? AND params_hash = ? AND algo_version = ?
+            GROUP BY diag_type
+        """, (stock_code, params_hash, algo_version)).fetchall()
+    return {row["diag_type"]: row["n"] for row in rows}
+
+
+# ── 7通りディープ調査キャッシュ ────────────────────────────────────────
+# サイドバー設定から完全独立。combo_key で7通りの組み合わせを区別。
+# params_hash は initial_cash だけ（指標設定はグリッドサーチで動的に決まるため）。
+
+def compute_seven_way_params_hash(initial_cash: float) -> str:
+    """7通りWFキャッシュキー用のパラメータハッシュ。初期資金のみに依存。"""
+    payload = {"initial_cash": float(initial_cash)}
+    s = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(s.encode("utf-8")).hexdigest()[:16]
+
+
+def load_seven_way_cache_batch(
+    stock_code: str, combo_key: str, end_dates: list[str],
+    params_hash: str, algo_version: str,
+) -> dict[str, dict]:
+    """指定 end_date 一覧に対する既存キャッシュをまとめて取得。
+    戻り値: {end_date: result_dict}。ヒットしなかった日付はキーに含まれない。
+    """
+    if not end_dates:
+        return {}
+    placeholders = ",".join("?" * len(end_dates))
+    sql = f"""
+        SELECT end_date, result_json FROM wf_seven_way_cache
+        WHERE stock_code = ? AND combo_key = ? AND params_hash = ? AND algo_version = ?
+          AND end_date IN ({placeholders})
+    """
+    params = [stock_code, combo_key, params_hash, algo_version, *end_dates]
+    out: dict[str, dict] = {}
+    with _conn() as conn:
+        for row in conn.execute(sql, params).fetchall():
+            out[row["end_date"]] = json.loads(row["result_json"])
+    return out
+
+
+def save_seven_way_cache(
+    stock_code: str, combo_key: str, end_date: str,
+    params_hash: str, algo_version: str,
+    result: dict,
+) -> None:
+    """1件の7通りWF診断結果を保存する（_* プレフィクスのメタキーは除去）。"""
+    clean = {k: v for k, v in result.items() if not k.startswith("_")}
+    with _conn() as conn:
+        conn.execute("""
+            INSERT OR REPLACE INTO wf_seven_way_cache
+                (stock_code, combo_key, end_date, params_hash, algo_version,
+                 result_json, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, datetime('now','localtime'))
+        """, (
+            stock_code, combo_key, end_date, params_hash, algo_version,
+            json.dumps(clean, ensure_ascii=False),
+        ))
+
+
+def count_seven_way_cache(stock_code: str, params_hash: str, algo_version: str) -> dict[str, int]:
+    """銘柄ごとの7通りキャッシュ件数を combo_key 別に返す（UI表示用）。"""
+    with _conn() as conn:
+        rows = conn.execute("""
+            SELECT combo_key, COUNT(*) AS n FROM wf_seven_way_cache
+            WHERE stock_code = ? AND params_hash = ? AND algo_version = ?
+            GROUP BY combo_key
+        """, (stock_code, params_hash, algo_version)).fetchall()
+    return {row["combo_key"]: row["n"] for row in rows}
