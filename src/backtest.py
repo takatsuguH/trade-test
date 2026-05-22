@@ -9,11 +9,14 @@ def run_backtest(
     risk: RiskManager | None = None,
     signal_col: str = "composite_signal",
     order_col: str = "order",
+    max_shares: int = 0,
 ) -> dict:
     if risk is None:
         risk = RiskManager()
 
     df = df.dropna(subset=[signal_col]).copy()
+    # シグナル発生翌日の始値で約定するための列（先読みバイアス排除）
+    df["_exec_price"] = df["Open"].shift(-1)
 
     cash = initial_cash
     position = 0
@@ -26,6 +29,8 @@ def run_backtest(
 
     for idx, row in df.iterrows():
         price = float(row["Close"])
+        _raw = row.get("_exec_price")
+        exec_price = float(_raw) if pd.notna(_raw) else price
         order = float(row.get(order_col, 0))
 
         # ポートフォリオ時価を記録
@@ -73,26 +78,28 @@ def run_backtest(
             )
             if can_rebuy:
                 invest_cash = cash * risk.max_position
-                shares = int(invest_cash // price)
+                shares = int(invest_cash // exec_price // 100) * 100
+                if max_shares > 0:
+                    shares = min(shares, int(max_shares // 100) * 100)
                 if shares > 0:
                     position = shares
-                    buy_price = price
-                    cash -= shares * price
+                    buy_price = exec_price
+                    cash -= shares * exec_price
                     last_sell_price = 0.0  # 買い戻し後はリセット
                     trades.append({
                         "date": idx, "type": "BUY",
-                        "price": price, "shares": shares, "profit": None,
+                        "price": exec_price, "shares": shares, "profit": None,
                     })
 
         elif order < 0 and position > 0:
-            cash += position * price
-            profit = (price - buy_price) * position
+            cash += position * exec_price
+            profit = (exec_price - buy_price) * position
             trades.append({
                 "date": idx, "type": "SELL",
-                "price": price, "shares": position, "profit": profit,
+                "price": exec_price, "shares": position, "profit": profit,
             })
             position = 0
-            last_sell_price = price  # 売却価格を記録
+            last_sell_price = exec_price  # 売却価格を記録
 
     # 最終日に保有株があれば時価清算
     final_price = float(df.iloc[-1]["Close"])
@@ -114,4 +121,5 @@ def run_backtest(
         "win_rate_pct": win_rate,
         "trades": trades_df,
         "portfolio_curve": pd.DataFrame(portfolio_curve),
+        "current_position": position,
     }
